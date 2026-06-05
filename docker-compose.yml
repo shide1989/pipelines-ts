@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: pipelines-postgres
+    environment:
+      POSTGRES_USER: pipelines
+      POSTGRES_PASSWORD: pipelines
+      POSTGRES_DB: pipelines
+    ports:
+      - "5432:5432"
+    volumes:
+      - pipelines_pg:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipelines -d pipelines"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pipelines_pg:
