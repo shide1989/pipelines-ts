@@ -1,8 +1,8 @@
 // Shared types for the durable runtime.
 
-export type WorkflowStatus = "running" | "suspended" | "completed" | "failed";
+export type WorkflowStatus = "pending" | "running" | "suspended" | "completed" | "failed";
 
-export type StepStatus = "completed" | "failed";
+export type StepStatus = "running" | "completed" | "failed";
 
 export type TimerStatus = "waiting" | "fired";
 
@@ -15,20 +15,38 @@ export interface WorkflowRun<R = unknown> {
   status: WorkflowStatus;
   error?: string;
   idempotencyKey?: string;
-  retryCount: number;
   createdAt: Date;
   updatedAt: Date;
+  // Populated by getRun() (the detail view), omitted by listRuns().
+  steps?: StepResult[];
+  logs?: LogEntry[];
 }
 
-/** A cached step output, mirrors the `workflow_steps` row. */
+/** A step result row from `workflow_steps`. */
 export interface StepResult<T = unknown> {
   stepId: string;
   output?: T;
   error?: string;
   status: StepStatus;
+  attempts: number;
 }
 
-/** Retry behaviour applied to step execution. */
+/** A derived event from the append-only `workflow_logs` stream. */
+export interface LogEntry {
+  id: number;
+  runId: string;
+  eventType: string;
+  payload: unknown;
+  createdAt: Date;
+}
+
+/** What `.run()` returns: a submitted (not yet executed) run. */
+export interface RunSubmission {
+  runId: string;
+  status: WorkflowStatus;
+}
+
+/** Per-step retry behaviour. */
 export interface RetryPolicy {
   maxRetries: number;
   backoffMs: number;

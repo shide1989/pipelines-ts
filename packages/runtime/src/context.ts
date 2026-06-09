@@ -2,18 +2,20 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseClient } from "./db";
-import type { StepResult } from "./types";
+import type { RetryPolicy } from "./types";
 
-/** Per-run state. Created by `workflow()`, never exposed to user code. */
+/** Per-run state. Built by the engine when it claims a run, never user-facing. */
 export interface WorkflowContext {
   runId: string;
   workflowName: string;
   db: DatabaseClient;
-  /** Per-method call counters: "createUser" → 2 (called twice). */
+  /** Resolved retry policy applied per durable step. */
+  retry: RetryPolicy;
+  /** Per-method call counters. */
   stepCounters: Map<string, number>;
   sleepCounter: number;
-  /** Step results pre-loaded on replay, keyed by step ID. */
-  cachedSteps: Map<string, StepResult>;
+  /** Completed step outputs pre-loaded on replay, keyed by step ID. */
+  cachedSteps: Map<string, unknown>;
 }
 
 /** `durable()` proxies and `sleep()` read the active context from here. */

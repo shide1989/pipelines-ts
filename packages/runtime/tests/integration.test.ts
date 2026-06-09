@@ -1,0 +1,239 @@
+// Integration tests — real Postgres, real worker, real LISTEN/NOTIFY.
+// Covers the V0.6 contract: decoupled submission, NOTIFY pickup, step caching,
+// replay, durable sleep + resume, idempotency, per-step retry, FatalError,
+// lifecycle hooks, worker recovery, and outside-workflow pass-through.
+
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { FatalError } from "../src/errors";
+import { getRun, replayRun } from "../src/management";
+import { durable } from "../src/proxy";
+import { sleep } from "../src/sleep";
+import type { LifecycleError, LifecycleResult } from "../src/types";
+import { startWorker } from "../src/worker";
+import { setDefaultDb, workflow } from "../src/workflow";
+import { resetSchema, testDb, truncateAll, waitFor } from "./helpers";
+
+const db = testDb();
+
+// --- Observable state, reset per test ---------------------------------------
+let prepareCalls = 0;
+let flakyAttempts = 0;
+let fatalCalls = 0;
+const finishes: LifecycleResult<unknown>[] = [];
+const errors: LifecycleError[] = [];
+
+// --- Test workflows (self-register on import) -------------------------------
+const echoSteps = durable({
+  prepare: async (x: { v: number }) => {
+    prepareCalls++;
+    return { doubled: x.v * 2 };
+  },
+});
+const echoWf = workflow(
+  "test.echo",
+  async (x: { v: number }) => (await echoSteps.prepare(x)).doubled,
+);
+
+const sleepSteps = durable({
+  before: async () => ({ at: "before" }),
+  after: async () => ({ at: "after" }),
+});
+const sleepWf = workflow("test.sleep", async () => {
+  await sleepSteps.before();
+  await sleep("1 second");
+  await sleepSteps.after();
+  return "done";
+});
+
+const flakySteps = durable({
+  flaky: async () => {
+    flakyAttempts++;
+    if (flakyAttempts < 3) throw new Error("transient");
+    return { ok: true };
+  },
+});
+const flakyWf = workflow("test.flaky", async () => (await flakySteps.flaky()).ok, {
+  retry: { maxRetries: 5, backoffMs: 5, backoffMultiplier: 1 },
+});
+
+const fatalSteps = durable({
+  boom: async () => {
+    fatalCalls++;
+    throw new FatalError("nope");
+  },
+});
+const fatalWf = workflow(
+  "test.fatal",
+  async () => {
+    await fatalSteps.boom();
+  },
+  { retry: { maxRetries: 3, backoffMs: 5, backoffMultiplier: 1 } },
+);
+
+const hooksWf = workflow(
+  "test.hooks",
+  async (x: { fail: boolean }) => {
+    if (x.fail) throw new FatalError("boom");
+    return "ok";
+  },
+  {
+    onFinish: (r) => {
+      finishes.push(r);
+    },
+    onError: (e) => {
+      errors.push(e);
+    },
+  },
+);
+
+// --- Worker lifecycle helper ------------------------------------------------
+async function withWorker<T>(fn: () => Promise<T>, maxTimerSleepMs = 100): Promise<T> {
+  const w = startWorker(db, { maxTimerSleepMs, reconcileMs: 1000 });
+  try {
+    return await fn();
+  } finally {
+    await w.stop();
+  }
+}
+
+const status = async (runId: string) => (await getRun(db, runId))?.status;
+
+beforeAll(async () => {
+  await resetSchema(db);
+  setDefaultDb(db);
+});
+afterAll(async () => {
+  await db.close();
+});
+beforeEach(async () => {
+  await truncateAll(db);
+  prepareCalls = 0;
+  flakyAttempts = 0;
+  fatalCalls = 0;
+  finishes.length = 0;
+  errors.length = 0;
+});
+
+describe("submission + execution", () => {
+  test("submit returns pending (decoupled), worker executes via NOTIFY, step cached", async () => {
+    const sub = await echoWf.run({ v: 21 });
+    expect(sub.status).toBe("pending"); // did NOT execute inline
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe(42);
+    expect(prepareCalls).toBe(1);
+    expect(run?.steps?.[0]?.stepId).toBe("prepare:0");
+    expect(run?.steps?.[0]?.status).toBe("completed");
+    const events = run?.logs?.map((l) => l.eventType) ?? [];
+    expect(events).toEqual(
+      expect.arrayContaining(["run.started", "step.running", "step.completed", "run.completed"]),
+    );
+  });
+
+  test("worker recovers a run submitted while nothing was listening", async () => {
+    const sub = await echoWf.run({ v: 7 }); // NOTIFY fires into the void (no worker)
+    await Bun.sleep(80);
+    expect(await status(sub.runId)).toBe("pending");
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect((await getRun(db, sub.runId))?.output).toBe(14);
+  });
+});
+
+describe("replay + caching", () => {
+  test("replay re-runs but skips cached steps (no re-execution)", async () => {
+    const sub = await echoWf.run({ v: 5 });
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect(prepareCalls).toBe(1);
+
+    await withWorker(async () => {
+      await replayRun(db, sub.runId);
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect(prepareCalls).toBe(1); // step served from cache, fn not re-invoked
+  });
+});
+
+describe("durable sleep", () => {
+  test("suspends on sleep, then an adaptive worker resumes to completion", async () => {
+    const sub = await sleepWf.run(undefined as never);
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "suspended");
+      const mid = await getRun(db, sub.runId);
+      expect(mid?.logs?.map((l) => l.eventType)).toContain("sleep.scheduled");
+      await waitFor(async () => (await status(sub.runId)) === "completed", 8000);
+    });
+
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe("done");
+    expect(run?.steps?.length).toBe(2);
+  });
+});
+
+describe("idempotency", () => {
+  test("same key returns the same run, inserts once", async () => {
+    const a = await echoWf.run({ v: 1 }, { idempotencyKey: "k1" });
+    const b = await echoWf.run({ v: 999 }, { idempotencyKey: "k1" });
+    expect(b.runId).toBe(a.runId);
+    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_runs");
+    expect(rows[0]?.n).toBe(1);
+  });
+});
+
+describe("retry + failure", () => {
+  test("a flaky step retries and records attempts", async () => {
+    const sub = await flakyWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect(flakyAttempts).toBe(3);
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe(true);
+    expect(run?.steps?.[0]?.attempts).toBe(3);
+  });
+
+  test("FatalError fails the run with no retries", async () => {
+    const sub = await fatalWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "failed");
+    });
+    expect(fatalCalls).toBe(1); // not retried
+    const run = await getRun(db, sub.runId);
+    expect(run?.error).toContain("nope");
+    expect(run?.steps?.[0]?.status).toBe("failed");
+  });
+});
+
+describe("lifecycle hooks", () => {
+  test("onFinish fires on completed + failed; onError only on failed", async () => {
+    const ok = await hooksWf.run({ fail: false });
+    const bad = await hooksWf.run({ fail: true });
+    await withWorker(async () => {
+      await waitFor(async () => (await status(ok.runId)) === "completed");
+      await waitFor(async () => (await status(bad.runId)) === "failed");
+      await waitFor(async () => finishes.length >= 2 && errors.length >= 1);
+    });
+    expect(finishes.map((f) => f.status).sort()).toEqual(["completed", "failed"]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.error).toContain("boom");
+  });
+});
+
+describe("outside a workflow", () => {
+  test("a durable step runs directly with no checkpointing", async () => {
+    const r = await echoSteps.prepare({ v: 21 });
+    expect(r).toEqual({ doubled: 42 });
+    expect(prepareCalls).toBe(1);
+    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_steps");
+    expect(rows[0]?.n).toBe(0); // nothing persisted
+  });
+});

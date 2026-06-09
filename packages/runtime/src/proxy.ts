@@ -1,15 +1,90 @@
 // durable() — Proxy-based step wrapper.
 //
-// Wraps an object of async functions and returns a structurally identical Proxy.
 // The `get` trap captures the method name (step ID base), reads the active
 // WorkflowContext from AsyncLocalStorage, derives a deterministic step ID
-// ("name:callIndex"), and checks the cache: hit → return cached, miss → execute,
-// guard serializability, persist, return. Falls through to direct execution when
-// there is no active context (steps stay testable outside workflows).
+// ("name:callIndex"), and on cache miss: writes an intent row (status='running'),
+// executes with per-step retry (incrementing `attempts`), guards serializability,
+// persists the result as 'completed', and logs. Falls through to direct execution
+// when there is no active context (steps stay testable outside workflows).
+
+import { workflowStorage } from "./context";
+import { assertSerializable, FatalError } from "./errors";
+import { toJsonb } from "./json";
+import { appendLog } from "./log";
 
 // biome-ignore lint/suspicious/noExplicitAny: structural constraint over arbitrary async methods.
 type AsyncSteps = Record<string, (...args: any[]) => Promise<any>>;
 
+const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export function durable<T extends AsyncSteps>(steps: T): T {
-  throw new Error(`Not implemented: durable(${Object.keys(steps).length} steps)`);
+  return new Proxy(steps, {
+    get(target, prop, receiver) {
+      const fn = Reflect.get(target, prop, receiver);
+      if (typeof prop !== "string" || typeof fn !== "function") return fn;
+
+      return async (...args: unknown[]) => {
+        const ctx = workflowStorage.getStore();
+        // No active workflow → call through directly, no checkpointing.
+        if (!ctx) return fn(...args);
+
+        const index = ctx.stepCounters.get(prop) ?? 0;
+        ctx.stepCounters.set(prop, index + 1);
+        const stepId = `${prop}:${index}`;
+
+        // Cache hit (replay): return the persisted output, don't re-execute.
+        if (ctx.cachedSteps.has(stepId)) return ctx.cachedSteps.get(stepId);
+
+        // Intent row: a leftover 'running' row (worker died mid-step) is in-doubt,
+        // NOT a cache hit, so it re-executes here (at-least-once).
+        await ctx.db.query(
+          `INSERT INTO workflow_steps (run_id, step_id, status, attempts)
+           VALUES ($1, $2, 'running', 0)
+           ON CONFLICT (run_id, step_id) DO UPDATE SET status = 'running'`,
+          [ctx.runId, stepId],
+        );
+        await appendLog(ctx.db, ctx.runId, "step.running", { stepId });
+
+        const { maxRetries, backoffMs, backoffMultiplier } = ctx.retry;
+        let attempt = 0; // failures so far
+        for (;;) {
+          try {
+            const output = await fn(...args);
+            assertSerializable(output, stepId); // throws FatalError → caught below
+            await ctx.db.query(
+              `UPDATE workflow_steps SET status = 'completed', output = $3::jsonb, attempts = $4
+               WHERE run_id = $1 AND step_id = $2`,
+              [ctx.runId, stepId, toJsonb(output), attempt + 1],
+            );
+            await appendLog(ctx.db, ctx.runId, "step.completed", { stepId, attempts: attempt + 1 });
+            ctx.cachedSteps.set(stepId, output);
+            return output;
+          } catch (err) {
+            attempt += 1;
+            await ctx.db.query(
+              "UPDATE workflow_steps SET attempts = $3 WHERE run_id = $1 AND step_id = $2",
+              [ctx.runId, stepId, attempt],
+            );
+
+            // FatalError or retries exhausted → mark the step failed and propagate
+            // (the engine turns this into a failed run).
+            if (err instanceof FatalError || attempt > maxRetries) {
+              const message = err instanceof Error ? err.message : String(err);
+              await ctx.db.query(
+                "UPDATE workflow_steps SET status = 'failed', error = $3 WHERE run_id = $1 AND step_id = $2",
+                [ctx.runId, stepId, message],
+              );
+              await appendLog(ctx.db, ctx.runId, "step.failed", {
+                stepId,
+                attempts: attempt,
+                error: message,
+              });
+              throw err;
+            }
+            await sleepMs(backoffMs * backoffMultiplier ** (attempt - 1));
+          }
+        }
+      };
+    },
+  });
 }

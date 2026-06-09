@@ -4,9 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run server.ts"
+    "start": "bun run server.ts",
+    "demo": "bun run demo.ts"
   },
   "dependencies": {
-    "pipelines": "workspace:*"
+    "drizzle-orm": "^0.45.2",
+    "pipelines": "workspace:*",
+    "postgres": "^3.4.9"
   }
 }

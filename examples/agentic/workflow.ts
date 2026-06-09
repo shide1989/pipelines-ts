@@ -35,9 +35,11 @@ export const processTask = workflow(
     const { jobId } = await steps.submitInference(ctx); // cached → never re-submitted on replay
 
     // Durable polling loop: zero compute while sleeping, survives restarts.
+    // "2 seconds" keeps the demo quick — real batch jobs poll over minutes/hours;
+    // the durability guarantee is identical at any duration.
     let result = await steps.checkInference({ jobId });
     while (result.status !== "completed") {
-      await sleep("30 seconds");
+      await sleep("2 seconds");
       result = await steps.checkInference({ jobId });
     }
 

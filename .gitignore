@@ -4,3 +4,11 @@ dist/
 .DS_Store
 .env
 .env.*
+
+# Editor config + spurious lockfile (pnpm is the package manager)
+.zed/
+bun.lock
+
+# Claude Code: commit only the shared project settings, ignore local + tooling
+.claude/*
+!.claude/settings.json

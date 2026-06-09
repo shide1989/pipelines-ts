@@ -1,23 +1,58 @@
 // Thin Bun.serve adapter over the Management API. NOT part of the runtime —
-// the transport is an application concern. No auth (production would need it).
-//
-//   POST /workflows/:name/run             → handle.run(input) → { runId }
-//   GET  /workflows/:name/runs/:runId      → getRun(db, runId)
-//   GET  /workflows/:name/runs             → listRuns(db, name)
-//   POST /workflows/:name/runs/:runId/replay → replayRun(db, runId)
+// transport is an application concern. No auth (production would need it).
+// Uses Bun's native `routes` (typed `req.params`) — no manual path parsing.
 
-import { createDatabaseClient, getRun, listRuns, replayRun, startTimerWorker } from "pipelines";
+import { desc, eq } from "drizzle-orm";
+import { getRun, replayRun, setDefaultDb, setup, startWorker } from "pipelines";
+import { createDb } from "./db";
+import { workflowRuns } from "./schema";
 import { processTask } from "./workflow";
 
 const PORT = 3000;
+const json = (body: unknown, status = 200) => Response.json(body, { status });
 
-export function main(): void {
-  const db = createDatabaseClient(process.env.DATABASE_URL ?? "");
-  startTimerWorker(db, { intervalMs: 5000 });
+const url = process.env.DATABASE_URL ?? "postgres://pipelines:pipelines@localhost:5432/pipelines";
+const { client, orm } = createDb(url);
 
-  // Route table wiring lives here once the runtime is implemented.
-  void { db, processTask, getRun, listRuns, replayRun, PORT };
-  throw new Error("Not implemented: server bootstrap");
-}
+await setup(client); // apply schema (idempotent)
+setDefaultDb(client); // handle.run() needs a db
+startWorker(client, { maxTimerSleepMs: 1000 }); // LISTEN new runs + adaptive timer poll + recovery
 
-main();
+Bun.serve({
+  port: PORT,
+  routes: {
+    // Submit a run → { runId, status: "pending" } (does not execute inline)
+    "/workflows/:name/run": {
+      POST: async (req) => {
+        const { input } = (await req.json()) as { input: unknown };
+        return json(await processTask.run(input as never));
+      },
+    },
+    // Typed list via Drizzle
+    "/workflows/:name/runs": {
+      GET: async (req) =>
+        json(
+          await orm
+            .select()
+            .from(workflowRuns)
+            .where(eq(workflowRuns.workflowName, req.params.name))
+            .orderBy(desc(workflowRuns.createdAt))
+            .limit(50),
+        ),
+    },
+    // Run detail (incl. steps + logs)
+    "/workflows/:name/runs/:runId": {
+      GET: async (req) => {
+        const run = await getRun(client, req.params.runId);
+        return run ? json(run) : json({ error: "not found" }, 404);
+      },
+    },
+    // Force re-execution of a finished run
+    "/workflows/:name/runs/:runId/replay": {
+      POST: async (req) => json(await replayRun(client, req.params.runId)),
+    },
+  },
+  error: (err) => json({ error: err.message }, 500),
+});
+
+console.log(`[agentic] listening on http://localhost:${PORT}`);

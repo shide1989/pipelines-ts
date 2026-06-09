@@ -4,8 +4,10 @@ A minimal, durable workflow engine for TypeScript/Bun. Workflows are plain async
 functions — durable checkpointing, replay, and long-lived timers are handled
 transparently via `Proxy` + `AsyncLocalStorage`. No compiler, no magic strings.
 
-> Status: **scaffold**. Public API surface and types are in place; runtime logic
-> is stubbed (`throw new Error("Not implemented")`). See `SPEC PIPLINES V0.5`.
+> Status: **Phase 1 + 2 implemented** (event-driven worker, durable sleep, per-step
+> retry, hybrid log). Streaming (Phase 3) and polish (Phase 4) are deferred. The
+> runtime is DB-client agnostic; the `agentic` example supplies a Drizzle/porsager
+> client. See `SPEC PIPLINES V0.6`.
 
 ## Layout
 

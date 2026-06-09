@@ -18,7 +18,7 @@ const steps = durable({
 export const onboard = workflow("onboard", async (email: string) => {
   const user = await steps.createUser(email);
   await steps.sendWelcome(email);
-  await sleep("7 days");
+  await sleep("7 seconds");
   await steps.sendCheckIn(email);
   return { userId: user.id };
 });
