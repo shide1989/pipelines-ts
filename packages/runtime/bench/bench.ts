@@ -10,10 +10,11 @@
 //  5. 3 workers    — same drain with three workers (own clients/sessions), lock contention included
 //
 // Numbers are local-docker numbers: they measure the engine's per-step round-trip
-// cost, not your production network. Each durable step costs 4 sequential queries
-// (intent INSERT, running log, completed UPDATE, completed log); each execution
-// adds ~9 fixed (lock, orphan-check, claim, logs, cache pre-load, terminal UPDATE,
-// unlock). Concurrency is bounded by the client pool (porsager default max 10).
+// cost, not your production network. Each durable step costs 2 sequential queries
+// (intent+log CTE, completed+log CTE); each execution adds ~8 fixed (submission
+// INSERT, lock, orphan-check, claim, started log, cache pre-load, terminal+log
+// CTE, unlock). Concurrency is bounded by the client pool (porsager default
+// max 10, minus 1 for the reserved ownership session).
 
 import { durable } from "../src/proxy";
 import { startWorker, type Worker } from "../src/worker";
@@ -149,7 +150,7 @@ await resetSchema(db);
 //    this shows where this Postgres saturates (and what a near-serial worker
 //    costs). max=2 is the floor: reserve() takes the ownership session OUT of
 //    the pool, so max=1 starves the worker's queries entirely (deadlock).
-for (const max of [2, 5, 10, 20, 30]) {
+for (const max of [2, 5, 10, 20, 30, 50]) {
   const N = 600;
   await submitMany(s1, N);
   const ms = await drain(N, 1, max);

@@ -66,11 +66,15 @@ export async function claimAndExecute(db: DatabaseClient, runId: string): Promis
 
   try {
     const output = await workflowStorage.run(ctx, () => def.fn(parseJsonb(row.input)));
+    // Terminal write + its log row in one statement (atomic, one round-trip).
     await db.query(
-      "UPDATE workflow_runs SET status = 'completed', output = $2::text::jsonb, error = NULL WHERE id = $1",
+      `WITH run AS (
+         UPDATE workflow_runs SET status = 'completed', output = $2::text::jsonb, error = NULL
+         WHERE id = $1
+       )
+       INSERT INTO workflow_logs (run_id, event_type) VALUES ($1, 'run.completed')`,
       [runId, toJsonb(output)],
     );
-    await appendLog(db, runId, "run.completed");
     await fireHooks(def, runId, row.workflow_name, "completed", output, undefined);
   } catch (err) {
     if (err instanceof SleepInterrupt) {
@@ -90,11 +94,13 @@ async function failRun(
   error: string,
   def?: RegisteredWorkflow,
 ): Promise<void> {
-  await db.query("UPDATE workflow_runs SET status = 'failed', error = $2 WHERE id = $1", [
-    runId,
-    error,
-  ]);
-  await appendLog(db, runId, "run.failed", { error });
+  await db.query(
+    `WITH run AS (
+       UPDATE workflow_runs SET status = 'failed', error = $2 WHERE id = $1
+     )
+     INSERT INTO workflow_logs (run_id, event_type, payload) VALUES ($1, 'run.failed', $3::text::jsonb)`,
+    [runId, error, toJsonb({ error })],
+  );
   if (def) await fireHooks(def, runId, workflowName, "failed", undefined, error);
 }
 

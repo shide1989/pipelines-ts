@@ -10,7 +10,6 @@
 import { workflowStorage } from "./context";
 import { assertSerializable, FatalError } from "./errors";
 import { toJsonb } from "./json";
-import { appendLog } from "./log";
 
 // biome-ignore lint/suspicious/noExplicitAny: structural constraint over arbitrary async methods.
 type AsyncSteps = Record<string, (...args: any[]) => Promise<any>>;
@@ -36,14 +35,19 @@ export function durable<T extends AsyncSteps>(steps: T): T {
         if (ctx.cachedSteps.has(stepId)) return ctx.cachedSteps.get(stepId);
 
         // Intent row: a leftover 'running' row (worker died mid-step) is in-doubt,
-        // NOT a cache hit, so it re-executes here (at-least-once).
+        // NOT a cache hit, so it re-executes here (at-least-once). The log row is
+        // folded into the same statement (data-modifying CTE): one round-trip,
+        // one commit, and the state write + its log line are atomic.
         await ctx.db.query(
-          `INSERT INTO workflow_steps (run_id, step_id, status, attempts)
-           VALUES ($1, $2, 'running', 0)
-           ON CONFLICT (run_id, step_id) DO UPDATE SET status = 'running'`,
-          [ctx.runId, stepId],
+          `WITH step AS (
+             INSERT INTO workflow_steps (run_id, step_id, status, attempts)
+             VALUES ($1, $2, 'running', 0)
+             ON CONFLICT (run_id, step_id) DO UPDATE SET status = 'running'
+           )
+           INSERT INTO workflow_logs (run_id, event_type, payload)
+           VALUES ($1, 'step.running', $3::text::jsonb)`,
+          [ctx.runId, stepId, toJsonb({ stepId })],
         );
-        await appendLog(ctx.db, ctx.runId, "step.running", { stepId });
 
         const { maxRetries, backoffMs, backoffMultiplier } = ctx.retry;
         let attempt = 0; // failures so far
@@ -52,11 +56,20 @@ export function durable<T extends AsyncSteps>(steps: T): T {
             const output = await fn(...args);
             assertSerializable(output, stepId); // throws FatalError → caught below
             await ctx.db.query(
-              `UPDATE workflow_steps SET status = 'completed', output = $3::text::jsonb, attempts = $4
-               WHERE run_id = $1 AND step_id = $2`,
-              [ctx.runId, stepId, toJsonb(output), attempt + 1],
+              `WITH step AS (
+                 UPDATE workflow_steps SET status = 'completed', output = $3::text::jsonb, attempts = $4
+                 WHERE run_id = $1 AND step_id = $2
+               )
+               INSERT INTO workflow_logs (run_id, event_type, payload)
+               VALUES ($1, 'step.completed', $5::text::jsonb)`,
+              [
+                ctx.runId,
+                stepId,
+                toJsonb(output),
+                attempt + 1,
+                toJsonb({ stepId, attempts: attempt + 1 }),
+              ],
             );
-            await appendLog(ctx.db, ctx.runId, "step.completed", { stepId, attempts: attempt + 1 });
             ctx.cachedSteps.set(stepId, output);
             return output;
           } catch (err) {
@@ -71,14 +84,19 @@ export function durable<T extends AsyncSteps>(steps: T): T {
             if (err instanceof FatalError || attempt > maxRetries) {
               const message = err instanceof Error ? err.message : String(err);
               await ctx.db.query(
-                "UPDATE workflow_steps SET status = 'failed', error = $3 WHERE run_id = $1 AND step_id = $2",
-                [ctx.runId, stepId, message],
+                `WITH step AS (
+                   UPDATE workflow_steps SET status = 'failed', error = $3
+                   WHERE run_id = $1 AND step_id = $2
+                 )
+                 INSERT INTO workflow_logs (run_id, event_type, payload)
+                 VALUES ($1, 'step.failed', $4::text::jsonb)`,
+                [
+                  ctx.runId,
+                  stepId,
+                  message,
+                  toJsonb({ stepId, attempts: attempt, error: message }),
+                ],
               );
-              await appendLog(ctx.db, ctx.runId, "step.failed", {
-                stepId,
-                attempts: attempt,
-                error: message,
-              });
               throw err;
             }
             await sleepMs(backoffMs * backoffMultiplier ** (attempt - 1));
