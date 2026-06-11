@@ -5,8 +5,14 @@
 import { durable, FatalError, sleep, workflow } from "pipelines";
 import { llm, loadDocs } from "./clients";
 
+/** processTask input — the single definition the server's cast points at too. */
+export interface Task {
+  prompt: string;
+  docId: string;
+}
+
 const steps = durable({
-  prepareContext: async (task: { prompt: string; docId: string }) => {
+  prepareContext: async (task: Task) => {
     const context = await loadDocs(task.docId); // fetch + assemble context window
     return { prompt: task.prompt, context };
   },
@@ -28,24 +34,21 @@ const steps = durable({
   },
 });
 
-export const processTask = workflow(
-  "processTask",
-  async (task: { prompt: string; docId: string }) => {
-    const ctx = await steps.prepareContext(task);
-    const { jobId } = await steps.submitInference(ctx); // cached → never re-submitted on replay
+export const processTask = workflow("processTask", async (task: Task) => {
+  const ctx = await steps.prepareContext(task);
+  const { jobId } = await steps.submitInference(ctx); // cached → never re-submitted on replay
 
-    // Durable polling loop: zero compute while sleeping, survives restarts.
-    // "2 seconds" keeps the demo quick — real batch jobs poll over minutes/hours;
-    // the durability guarantee is identical at any duration.
-    let result = await steps.checkInference({ jobId });
-    while (result.status !== "completed") {
-      await sleep("2 seconds");
-      result = await steps.checkInference({ jobId });
-    }
+  // Durable polling loop: zero compute while sleeping, survives restarts.
+  // "2 seconds" keeps the demo quick — real batch jobs poll over minutes/hours;
+  // the durability guarantee is identical at any duration.
+  let result = await steps.checkInference({ jobId });
+  while (result.status !== "completed") {
+    await sleep("2 seconds");
+    result = await steps.checkInference({ jobId });
+  }
 
-    // Loop exits only on status === "completed", which guarantees output is set.
-    // biome-ignore lint/style/noNonNullAssertion: narrowed by the loop condition above.
-    const validated = await steps.validateOutput({ output: result.output! });
-    return { output: validated.output };
-  },
-);
+  // Loop exits only on status === "completed", which guarantees output is set.
+  // biome-ignore lint/style/noNonNullAssertion: narrowed by the loop condition above.
+  const validated = await steps.validateOutput({ output: result.output! });
+  return { output: validated.output };
+});

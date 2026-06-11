@@ -6,7 +6,7 @@ import { desc, eq } from "drizzle-orm";
 import { getRun, replayRun, setDefaultDb, setup, startWorker } from "pipelines";
 import { createDb } from "./db";
 import { workflowRuns } from "./schema";
-import { processTask } from "./workflow";
+import { processTask, type Task } from "./workflow";
 
 const PORT = 3000;
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -21,11 +21,12 @@ startWorker(client, { maxTimerSleepMs: 1000 }); // LISTEN new runs + adaptive ti
 Bun.serve({
   port: PORT,
   routes: {
-    // Submit a run → { runId, status: "pending" } (does not execute inline)
-    "/workflows/:name/run": {
+    // Submit a run → { runId, status: "pending" } (does not execute inline).
+    // Route is literal: this handler only knows the processTask handle
+    "/workflows/processTask/run": {
       POST: async (req) => {
-        const { input } = (await req.json()) as { input: unknown };
-        return json(await processTask.run(input as never));
+        const { input } = (await req.json()) as { input: Task };
+        return json(await processTask.run(input));
       },
     },
     // Typed list via Drizzle

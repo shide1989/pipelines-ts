@@ -37,7 +37,9 @@ const submit = (input: unknown) =>
   }).then((r) => r.json()) as Promise<{ runId: string; status: string }>;
 
 const getRun = (runId: string) =>
-  fetch(`${BASE}/workflows/processTask/runs/${runId}`).then((r) => r.json()) as Promise<WorkflowRun>;
+  fetch(`${BASE}/workflows/processTask/runs/${runId}`).then((r) =>
+    r.json(),
+  ) as Promise<WorkflowRun>;
 
 const untilStatus = (runId: string, ...statuses: string[]) =>
   poll(async () => {
@@ -55,14 +57,22 @@ function show(label: string, run: WorkflowRun): void {
 }
 
 try {
-  await poll(async () => ((await fetch(`${BASE}/workflows/processTask/runs`)).ok ? true : undefined));
+  await poll(async () =>
+    (await fetch(`${BASE}/workflows/processTask/runs`)).ok ? true : undefined,
+  );
   console.log("server up · submitting processTask…");
 
   const { runId, status } = await submit({ prompt: "Summarize the report", docId: "doc_42" });
   console.log(`runId ${runId} returned immediately (status: ${status})`);
 
-  show("⏸  suspended on the durable sleep (zero compute while waiting):", await untilStatus(runId, "suspended"));
-  show("✅ finished (cached steps skipped on resume — no re-pay):", await untilStatus(runId, "completed", "failed"));
+  show(
+    "⏸  suspended on the durable sleep (zero compute while waiting):",
+    await untilStatus(runId, "suspended"),
+  );
+  show(
+    "✅ finished (cached steps skipped on resume — no re-pay):",
+    await untilStatus(runId, "completed", "failed"),
+  );
 } finally {
   server.kill();
 }
