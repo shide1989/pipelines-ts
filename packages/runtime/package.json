@@ -5,6 +5,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "bench": "bun run bench/bench.ts"
+  },
   "devDependencies": {
     "postgres": "^3.4.9"
   }
