@@ -45,6 +45,8 @@ export function startWorker(
   // Ownership session: all of this worker's advisory locks live here, so they
   // share the worker's fate. Never used for run/step writes (those stay on the
   // pool) — it must be free to die with the process, releasing every lock.
+  // NOTE: reserve() typically takes this connection OUT of the client's pool —
+  // a pool of 1 starves the worker's queries entirely. Size pools ≥ 2.
   const ownership = db.reserve();
   ownership.catch((err) =>
     console.error("[pipelines] failed to reserve the ownership session:", err),

@@ -23,8 +23,12 @@ const unsafeQuery =
     >;
 
 /** A DatabaseClient adapter over porsager — the same shape as the example's wrapper. */
-export function testDb(): TestDb {
-  const sql = postgres(TEST_URL, { onnotice: () => {} });
+export function testDb(options?: { max?: number }): TestDb {
+  // Spread carefully: `max: undefined` would override porsager's default (10).
+  const sql = postgres(TEST_URL, {
+    onnotice: () => {},
+    ...(options?.max !== undefined && { max: options.max }),
+  });
   return {
     raw: sql,
     query: unsafeQuery(sql),

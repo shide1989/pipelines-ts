@@ -48,10 +48,10 @@ async function submitMany(wf: typeof s1, n: number): Promise<number> {
 }
 
 /** Drain `n` pre-submitted runs with `workers` workers; returns elapsed ms. */
-async function drain(n: number, workerCount: number): Promise<number> {
+async function drain(n: number, workerCount: number, poolMax?: number): Promise<number> {
   // Separate client per worker — own pool, own LISTEN, own ownership session,
   // like real processes would have.
-  const clients = Array.from({ length: workerCount }, () => testDb());
+  const clients = Array.from({ length: workerCount }, () => testDb({ max: poolMax }));
   const workers: Worker[] = clients.map((c) => startWorker(c, { reconcileMs: 60_000 }));
   const t0 = performance.now();
   try {
@@ -141,6 +141,20 @@ await resetSchema(db);
   const ms = await drain(N, 3);
   console.log(
     `drain s1 ×3w    ${fmt((N / ms) * 1000)} workflows/sec   (${N} runs in ${fmt(ms)}ms)`,
+  );
+  await truncateAll(db);
+}
+
+// 6. Pool-size sweep, 1 worker — the pool is the de facto concurrency cap, so
+//    this shows where this Postgres saturates (and what a near-serial worker
+//    costs). max=2 is the floor: reserve() takes the ownership session OUT of
+//    the pool, so max=1 starves the worker's queries entirely (deadlock).
+for (const max of [2, 5, 10, 20, 30]) {
+  const N = 600;
+  await submitMany(s1, N);
+  const ms = await drain(N, 1, max);
+  console.log(
+    `pool max=${String(max).padEnd(2)}     ${fmt((N / ms) * 1000)} workflows/sec   (${N} runs in ${fmt(ms)}ms)`,
   );
   await truncateAll(db);
 }
