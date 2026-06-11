@@ -27,4 +27,5 @@ pnpm install
 docker compose up -d        # Postgres on :5432, schema auto-applied
 pnpm check                  # biome format + lint + organize imports
 pnpm typecheck              # tsc --noEmit across the workspace
+bun test packages/runtime   # integration tests — need the Postgres above
 ```

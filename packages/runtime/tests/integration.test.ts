@@ -87,8 +87,11 @@ const hooksWf = workflow(
 );
 
 // --- Worker lifecycle helper ------------------------------------------------
-async function withWorker<T>(fn: () => Promise<T>, maxTimerSleepMs = 100): Promise<T> {
-  const w = startWorker(db, { maxTimerSleepMs, reconcileMs: 1000 });
+async function withWorker<T>(
+  fn: () => Promise<T>,
+  options?: Parameters<typeof startWorker>[1],
+): Promise<T> {
+  const w = startWorker(db, { maxTimerSleepMs: 100, reconcileMs: 1000, ...options });
   try {
     return await fn();
   } finally {
@@ -186,6 +189,55 @@ describe("idempotency", () => {
     expect(b.runId).toBe(a.runId);
     const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_runs");
     expect(rows[0]?.n).toBe(1);
+  });
+
+  test("concurrent same-key submits race to one run, none throws", async () => {
+    const subs = await Promise.all(
+      Array.from({ length: 10 }, () => echoWf.run({ v: 1 }, { idempotencyKey: "race" })),
+    );
+    expect(new Set(subs.map((s) => s.runId)).size).toBe(1);
+    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_runs");
+    expect(rows[0]?.n).toBe(1);
+  });
+});
+
+describe("crash recovery", () => {
+  test("a run stuck 'running' (dead worker) is reclaimed and completes", async () => {
+    const sub = await echoWf.run({ v: 4 }); // NOTIFY into the void (no worker yet)
+    // Simulate a worker that claimed the run and died: status 'running', no heartbeat.
+    await db.query("UPDATE workflow_runs SET status = 'running' WHERE id = $1", [sub.runId]);
+    await Bun.sleep(250); // let the claim go stale past staleRunningMs
+
+    await withWorker(
+      async () => {
+        await waitFor(async () => (await status(sub.runId)) === "completed");
+      },
+      { staleRunningMs: 200 },
+    );
+
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe(8);
+    expect(run?.logs?.map((l) => l.eventType)).toContain("run.reclaimed");
+  });
+
+  test("a suspended run whose timer fired without a resume self-heals", async () => {
+    const sub = await sleepWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "suspended");
+    });
+    // Simulate the poller crashing between marking the timer fired and resuming.
+    await db.query("UPDATE workflow_timers SET status = 'fired' WHERE run_id = $1", [sub.runId]);
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect((await getRun(db, sub.runId))?.output).toBe("done");
+  });
+});
+
+describe("registration", () => {
+  test("duplicate workflow name throws at registration", () => {
+    expect(() => workflow("test.echo", async () => 1)).toThrow(/already registered/);
   });
 });
 

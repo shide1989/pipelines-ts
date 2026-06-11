@@ -7,12 +7,14 @@
 //                          fire due timers (SKIP LOCKED) and resume their runs.
 //                          A poll is irreducible: nothing inserts a row when a
 //                          timestamp passes, so there's no NOTIFY to hang on.
-// Plus startup + periodic recovery: scan pending / due-suspended runs to recover
-// any NOTIFY missed while down or dropped while up. The persisted rows are the
-// durable queue; NOTIFY is only a latency optimization.
+// Plus startup + periodic recovery: scan pending / due-suspended / stale-running
+// runs to recover any NOTIFY missed while down or dropped while up — and any run
+// orphaned by a dead worker. The persisted rows are the durable queue; NOTIFY is
+// only a latency optimization.
 
 import type { DatabaseClient, Subscription } from "./db";
 import { claimAndExecute } from "./engine";
+import { appendLog } from "./log";
 
 export interface Worker {
   stop: () => Promise<void>;
@@ -20,19 +22,30 @@ export interface Worker {
 
 export function startWorker(
   db: DatabaseClient,
-  options?: { maxTimerSleepMs?: number; reconcileMs?: number },
+  options?: { maxTimerSleepMs?: number; reconcileMs?: number; staleRunningMs?: number },
 ): Worker {
   const cap = options?.maxTimerSleepMs ?? 60_000;
   const reconcileMs = options?.reconcileMs ?? 60_000;
+  // A 'running' run whose row hasn't been touched for this long is presumed
+  // orphaned by a dead worker and reclaimed. The engine heartbeats at a quarter
+  // of this, so a live execution stays several beats ahead of the threshold.
+  // Set it consistently across workers. (A worker alive-but-partitioned past the
+  // threshold gets double-executed — at-least-once, same as the spec's model.)
+  const staleRunningMs = options?.staleRunningMs ?? 60_000;
   let running = true;
   let sub: Subscription | undefined;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  const inflight = new Set<Promise<void>>();
 
-  const execute = (runId: string) =>
-    claimAndExecute(db, runId).catch((err) =>
+  const execute = (runId: string) => {
+    const p = claimAndExecute(db, runId, staleRunningMs / 4).catch((err) =>
       console.error(`[pipelines] execute failed for ${runId}:`, err),
     );
+    inflight.add(p);
+    p.finally(() => inflight.delete(p));
+    return p;
+  };
 
   // Source A: push — new pending runs.
   db.listen("workflow_runs", (runId) => void execute(runId))
@@ -68,21 +81,41 @@ export function startWorker(
     if (running) pollTimer = setTimeout(pollTimers, delay);
   };
 
-  // Recovery: process pending runs + due-suspended runs missed while down/dropped.
+  // Recovery, three kinds of strandable run:
+  //  - 'running' but untouched past the stale threshold → orphaned by a dead
+  //    worker (the heartbeat keeps live ones fresh) → reset to 'pending'.
+  //  - 'pending' → a NOTIFY missed while down or dropped while up.
+  //  - 'suspended' with no future timer left to wait on → due, or stuck because
+  //    a timer was marked 'fired' but the resume never landed (poller crash or
+  //    race). sleep()'s time-based skip-through makes re-claiming always safe.
   const recover = async () => {
+    const reclaimed = await db.query<{ id: string }>(
+      `UPDATE workflow_runs SET status = 'pending'
+       WHERE status = 'running' AND updated_at < now() - $1::interval
+       RETURNING id`,
+      [`${staleRunningMs} milliseconds`],
+    );
+    for (const { id } of reclaimed) await appendLog(db, id, "run.reclaimed");
+
     const rows = await db.query<{ id: string }>(
       `SELECT id FROM workflow_runs WHERE status = 'pending'
        UNION
        SELECT r.id FROM workflow_runs r
-       JOIN workflow_timers t ON t.run_id = r.id
-       WHERE r.status = 'suspended' AND t.status = 'waiting' AND t.wake_at <= now()`,
+       WHERE r.status = 'suspended'
+         AND NOT EXISTS (SELECT 1 FROM workflow_timers t WHERE t.run_id = r.id
+                         AND t.status = 'waiting' AND t.wake_at > now())
+         AND EXISTS (SELECT 1 FROM workflow_timers t WHERE t.run_id = r.id
+                     AND (t.status = 'fired' OR t.wake_at <= now()))`,
     );
     for (const { id } of rows) void execute(id);
   };
 
-  recover().catch((err) => console.error("[pipelines] recovery failed:", err));
+  const runRecover = () =>
+    recover().catch((err) => console.error("[pipelines] recovery failed:", err));
+
+  void runRecover();
   pollTimers();
-  reconcileTimer = setInterval(() => void recover().catch(() => {}), reconcileMs);
+  reconcileTimer = setInterval(() => void runRecover(), reconcileMs);
 
   return {
     stop: async () => {
@@ -90,6 +123,7 @@ export function startWorker(
       if (pollTimer) clearTimeout(pollTimer);
       if (reconcileTimer) clearInterval(reconcileTimer);
       await sub?.unlisten();
+      await Promise.all(inflight); // drain in-flight executions before reporting stopped
     },
   };
 }

@@ -48,6 +48,8 @@ export function workflow<T, R>(
   fn: (input: T) => Promise<R>,
   options?: WorkflowOptions<R>,
 ): WorkflowHandle<T> {
+  // Last-import-wins would silently route runs to the wrong fn — fail at import.
+  if (registry.has(name)) throw new Error(`workflow "${name}" is already registered`);
   registry.set(name, {
     fn: fn as (input: unknown) => Promise<unknown>,
     options: options as WorkflowOptions<unknown> | undefined,
@@ -70,21 +72,26 @@ async function submitRun(
   input: unknown,
   idempotencyKey?: string,
 ): Promise<RunSubmission> {
-  if (idempotencyKey) {
-    const existing = await db.query<SubmitRow>(
-      "SELECT id, status FROM workflow_runs WHERE workflow_name = $1 AND idempotency_key = $2",
-      [name, idempotencyKey],
-    );
-    const found = existing[0];
-    if (found) return { runId: found.id, status: found.status };
-  }
-
-  const rows = await db.query<SubmitRow>(
+  // INSERT-first (not SELECT-then-INSERT, which races concurrent same-key
+  // submits into a unique violation). NULL keys never conflict, so the no-key
+  // path always returns from the INSERT; DO NOTHING means the fallback SELECT
+  // only runs for a key that already exists.
+  const inserted = await db.query<SubmitRow>(
     `INSERT INTO workflow_runs (workflow_name, input, idempotency_key, status)
-     VALUES ($1, $2::jsonb, $3, 'pending') RETURNING id, status`,
+     VALUES ($1, $2::text::jsonb, $3, 'pending')
+     ON CONFLICT (workflow_name, idempotency_key) DO NOTHING
+     RETURNING id, status`,
     [name, toJsonb(input), idempotencyKey ?? null],
   );
-  const row = rows[0] as SubmitRow;
+  const row =
+    inserted[0] ??
+    (
+      await db.query<SubmitRow>(
+        "SELECT id, status FROM workflow_runs WHERE workflow_name = $1 AND idempotency_key = $2",
+        [name, idempotencyKey],
+      )
+    )[0];
+  if (!row) throw new Error(`Failed to submit run for workflow "${name}"`);
   return { runId: row.id, status: row.status };
 }
 

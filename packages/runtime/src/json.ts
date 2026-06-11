@@ -1,16 +1,21 @@
 // JSONB (de)serialization owned by the runtime, not the driver.
 //
-// Drivers disagree on JSONB: some hand back a parsed object, some (porsager via
-// `unsafe`) a raw string. So the runtime serializes explicitly on write (always
-// paired with a `$n::jsonb` cast in the SQL) and tolerates either shape on read.
+// Drivers MUST be kept out of the (de)serialization path, in both directions:
+//  - Write: a bare `$n::jsonb` cast makes PG infer the param as jsonb, and
+//    drivers (porsager included) auto-JSON.stringify jsonb params — double-
+//    encoding our pre-stringified value. `$n::text::jsonb` pins the param to
+//    text, so the string crosses the wire untouched and PG parses it once.
+//  - Read: drivers disagree on jsonb columns (parsed object vs raw string —
+//    ambiguous when the stored value IS a string). A `::text` cast on the
+//    column makes every driver return the same raw JSON text.
+// So: text in, text out; the runtime is the only (de)serializer.
 
-/** Serialize a value for a JSONB column param. Always cast the placeholder `::jsonb`. */
+/** Serialize a value for a JSONB column param. Always cast the placeholder `::text::jsonb`. */
 export function toJsonb(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-/** Read a JSONB column the driver may return as string OR object. SQL NULL → undefined. */
-export function parseJsonb(value: unknown): unknown {
-  if (value === null || value === undefined) return undefined;
-  return typeof value === "string" ? JSON.parse(value) : value;
+/** Parse a JSONB column read with a `::text` cast. SQL NULL → undefined. */
+export function parseJsonb(value: string | null | undefined): unknown {
+  return value == null ? undefined : JSON.parse(value);
 }

@@ -52,7 +52,7 @@ export function durable<T extends AsyncSteps>(steps: T): T {
             const output = await fn(...args);
             assertSerializable(output, stepId); // throws FatalError → caught below
             await ctx.db.query(
-              `UPDATE workflow_steps SET status = 'completed', output = $3::jsonb, attempts = $4
+              `UPDATE workflow_steps SET status = 'completed', output = $3::text::jsonb, attempts = $4
                WHERE run_id = $1 AND step_id = $2`,
               [ctx.runId, stepId, toJsonb(output), attempt + 1],
             );

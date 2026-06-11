@@ -1,26 +1,36 @@
 // management.ts — programmatic, in-process control surface.
 // Drivers (HTTP, CLI, queue consumer) wrap these; the runtime opens no port.
+//
+// JSONB columns are always read with a `::text` cast (see json.ts) — explicit
+// column lists, never `SELECT *`.
 
 import type { DatabaseClient } from "./db";
-import { mapRun } from "./engine";
 import { parseJsonb } from "./json";
 import type { LogEntry, RunSubmission, StepResult, WorkflowRun } from "./types";
 
-// biome-ignore lint/suspicious/noExplicitAny: raw snake_case rows from the driver.
-type Row = any;
+const RUN_COLUMNS = `id, workflow_name, input::text AS input, output::text AS output,
+   status, error, idempotency_key, created_at, updated_at`;
 
 /** Full run detail: the run row plus its steps and ordered log trail. */
 export async function getRun(db: DatabaseClient, runId: string): Promise<WorkflowRun | null> {
-  const rows = await db.query<Row>("SELECT * FROM workflow_runs WHERE id = $1", [runId]);
+  const rows = await db.query<RunRow>(`SELECT ${RUN_COLUMNS} FROM workflow_runs WHERE id = $1`, [
+    runId,
+  ]);
   const row = rows[0];
   if (!row) return null;
 
   const run = mapRun(row);
   const [steps, logs] = await Promise.all([
-    db.query<Row>("SELECT * FROM workflow_steps WHERE run_id = $1 ORDER BY created_at, step_id", [
-      runId,
-    ]),
-    db.query<Row>("SELECT * FROM workflow_logs WHERE run_id = $1 ORDER BY id", [runId]),
+    db.query<StepRow>(
+      `SELECT step_id, output::text AS output, error, status, attempts
+       FROM workflow_steps WHERE run_id = $1 ORDER BY created_at, step_id`,
+      [runId],
+    ),
+    db.query<LogRow>(
+      `SELECT id, run_id, event_type, payload::text AS payload, created_at
+       FROM workflow_logs WHERE run_id = $1 ORDER BY id`,
+      [runId],
+    ),
   ]);
   run.steps = steps.map(mapStep);
   run.logs = logs.map(mapLog);
@@ -32,8 +42,8 @@ export async function listRuns(
   workflowName: string,
   options?: { limit?: number; offset?: number },
 ): Promise<WorkflowRun[]> {
-  const rows = await db.query<Row>(
-    `SELECT * FROM workflow_runs WHERE workflow_name = $1
+  const rows = await db.query<RunRow>(
+    `SELECT ${RUN_COLUMNS} FROM workflow_runs WHERE workflow_name = $1
      ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
     [workflowName, options?.limit ?? 50, options?.offset ?? 0],
   );
@@ -63,7 +73,52 @@ export async function replayRun(db: DatabaseClient, runId: string): Promise<RunS
   return { runId, status: "pending" };
 }
 
-function mapStep(row: Row): StepResult {
+// --- Row mapping ------------------------------------------------------------
+
+interface RunRow {
+  id: string;
+  workflow_name: string;
+  input: string;
+  output: string | null;
+  status: WorkflowRun["status"];
+  error: string | null;
+  idempotency_key: string | null;
+  created_at: string | Date;
+  updated_at: string | Date;
+}
+
+interface StepRow {
+  step_id: string;
+  output: string | null;
+  error: string | null;
+  status: StepResult["status"];
+  attempts: number | string;
+}
+
+interface LogRow {
+  id: number | string; // BIGINT: some drivers return it as a string
+  run_id: string;
+  event_type: string;
+  payload: string;
+  created_at: string | Date;
+}
+
+/** Map a raw snake_case run row into the public WorkflowRun shape. */
+export function mapRun<R = unknown>(row: RunRow): WorkflowRun<R> {
+  return {
+    id: row.id,
+    workflowName: row.workflow_name,
+    input: parseJsonb(row.input),
+    output: parseJsonb(row.output) as R | undefined,
+    status: row.status,
+    error: row.error ?? undefined,
+    idempotencyKey: row.idempotency_key ?? undefined,
+    createdAt: new Date(row.created_at),
+    updatedAt: new Date(row.updated_at),
+  };
+}
+
+function mapStep(row: StepRow): StepResult {
   return {
     stepId: row.step_id,
     output: parseJsonb(row.output),
@@ -73,7 +128,7 @@ function mapStep(row: Row): StepResult {
   };
 }
 
-function mapLog(row: Row): LogEntry {
+function mapLog(row: LogRow): LogEntry {
   return {
     id: Number(row.id),
     runId: row.run_id,

@@ -11,6 +11,7 @@ export type LogEventType =
   | "run.started"
   | "run.resumed"
   | "run.suspended"
+  | "run.reclaimed"
   | "run.completed"
   | "run.failed"
   | "step.running"
@@ -25,7 +26,7 @@ export async function appendLog(
   payload: Record<string, unknown> = {},
 ): Promise<void> {
   await db.query(
-    "INSERT INTO workflow_logs (run_id, event_type, payload) VALUES ($1, $2, $3::jsonb)",
+    "INSERT INTO workflow_logs (run_id, event_type, payload) VALUES ($1, $2, $3::text::jsonb)",
     [runId, eventType, toJsonb(payload)],
   );
 }

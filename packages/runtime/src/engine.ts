@@ -11,14 +11,14 @@ import type { DatabaseClient } from "./db";
 import { SleepInterrupt } from "./errors";
 import { parseJsonb, toJsonb } from "./json";
 import { appendLog } from "./log";
-import type { RetryPolicy, WorkflowRun } from "./types";
+import type { RetryPolicy } from "./types";
 import { getRegisteredWorkflow, type RegisteredWorkflow } from "./workflow";
 
 const DEFAULT_RETRY: RetryPolicy = { maxRetries: 3, backoffMs: 1000, backoffMultiplier: 2 };
 
 interface ClaimRow {
   workflow_name: string;
-  input: unknown;
+  input: string;
   prev_status: string;
 }
 
@@ -26,14 +26,22 @@ interface ClaimRow {
  * Atomically claim a `pending`/`suspended` run and run it to its next checkpoint
  * or terminal state. No-op if another worker already claimed it (the WHERE guard
  * + row lock make the transition single-winner without explicit transactions).
+ *
+ * While executing, a heartbeat touches the run row every `heartbeatMs` so the
+ * worker's stale-claim reclaim (which keys off `updated_at`) can tell a live
+ * long-running execution from one orphaned by a dead worker.
  */
-export async function claimAndExecute(db: DatabaseClient, runId: string): Promise<void> {
+export async function claimAndExecute(
+  db: DatabaseClient,
+  runId: string,
+  heartbeatMs = 15_000,
+): Promise<void> {
   const claimed = await db.query<ClaimRow>(
     `WITH cur AS (SELECT status FROM workflow_runs WHERE id = $1 FOR UPDATE)
      UPDATE workflow_runs r SET status = 'running'
      FROM cur
      WHERE r.id = $1 AND r.status IN ('pending', 'suspended')
-     RETURNING r.workflow_name, r.input, cur.status AS prev_status`,
+     RETURNING r.workflow_name, r.input::text AS input, cur.status AS prev_status`,
     [runId],
   );
   const row = claimed[0];
@@ -62,10 +70,21 @@ export async function claimAndExecute(db: DatabaseClient, runId: string): Promis
     cachedSteps: await loadCachedSteps(db, runId),
   };
 
+  // The WHERE guard makes the heartbeat stop mattering once sleep() suspends
+  // the run; failures are logged but not fatal — a missed beat only narrows the
+  // reclaim margin, and if the DB is down the execution itself fails loudly.
+  const heartbeat = setInterval(() => {
+    void db
+      .query("UPDATE workflow_runs SET updated_at = now() WHERE id = $1 AND status = 'running'", [
+        runId,
+      ])
+      .catch((err) => console.error(`[pipelines] heartbeat failed for ${runId}:`, err));
+  }, heartbeatMs);
+
   try {
     const output = await workflowStorage.run(ctx, () => def.fn(parseJsonb(row.input)));
     await db.query(
-      "UPDATE workflow_runs SET status = 'completed', output = $2::jsonb, error = NULL WHERE id = $1",
+      "UPDATE workflow_runs SET status = 'completed', output = $2::text::jsonb, error = NULL WHERE id = $1",
       [runId, toJsonb(output)],
     );
     await appendLog(db, runId, "run.completed");
@@ -78,6 +97,8 @@ export async function claimAndExecute(db: DatabaseClient, runId: string): Promis
     }
     const message = err instanceof Error ? err.message : String(err);
     await failRun(db, runId, row.workflow_name, message, def);
+  } finally {
+    clearInterval(heartbeat);
   }
 }
 
@@ -125,40 +146,11 @@ export async function loadCachedSteps(
   db: DatabaseClient,
   runId: string,
 ): Promise<Map<string, unknown>> {
-  const rows = await db.query<{ step_id: string; output: unknown }>(
-    "SELECT step_id, output FROM workflow_steps WHERE run_id = $1 AND status = 'completed'",
+  const rows = await db.query<{ step_id: string; output: string | null }>(
+    "SELECT step_id, output::text AS output FROM workflow_steps WHERE run_id = $1 AND status = 'completed'",
     [runId],
   );
   const map = new Map<string, unknown>();
   for (const row of rows) map.set(row.step_id, parseJsonb(row.output));
   return map;
-}
-
-// --- Row mapping ------------------------------------------------------------
-
-interface RunRow {
-  id: string;
-  workflow_name: string;
-  input: unknown;
-  output: unknown;
-  status: WorkflowRun["status"];
-  error: string | null;
-  idempotency_key: string | null;
-  created_at: string | Date;
-  updated_at: string | Date;
-}
-
-/** Map a raw snake_case run row into the public WorkflowRun shape. */
-export function mapRun<R = unknown>(row: RunRow): WorkflowRun<R> {
-  return {
-    id: row.id,
-    workflowName: row.workflow_name,
-    input: parseJsonb(row.input),
-    output: parseJsonb(row.output) as R | undefined,
-    status: row.status,
-    error: row.error ?? undefined,
-    idempotencyKey: row.idempotency_key ?? undefined,
-    createdAt: new Date(row.created_at),
-    updatedAt: new Date(row.updated_at),
-  };
 }

@@ -15,12 +15,23 @@ export async function sleep(duration: string): Promise<void> {
 
   const sleepId = `sleep:${ctx.sleepCounter++}`;
 
-  const rows = await ctx.db.query<{ status: string }>(
-    "SELECT status FROM workflow_timers WHERE run_id = $1 AND sleep_id = $2",
+  // Replay: skip through if the timer fired OR its wake time has passed. The
+  // time-based check matters: the poller's 'fired' mark and the resume claim are
+  // not atomic, so a resume can replay before (or without) the mark landing —
+  // elapsed time alone must be enough to make progress. Mark it fired on the way
+  // through so recovery (which scans timer state) sees it as consumed.
+  const rows = await ctx.db.query<{ elapsed: boolean }>(
+    `SELECT (status = 'fired' OR wake_at <= now()) AS elapsed
+     FROM workflow_timers WHERE run_id = $1 AND sleep_id = $2`,
     [ctx.runId, sleepId],
   );
-  // Replay: timer already fired → skip through and continue past the sleep.
-  if (rows[0]?.status === "fired") return;
+  if (rows[0]?.elapsed) {
+    await ctx.db.query(
+      "UPDATE workflow_timers SET status = 'fired' WHERE run_id = $1 AND sleep_id = $2",
+      [ctx.runId, sleepId],
+    );
+    return;
+  }
 
   // First execution (or still waiting): schedule the timer, suspend, unwind.
   // wake_at is computed from the DB clock (now() + interval) — the same clock the
