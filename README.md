@@ -7,8 +7,8 @@ transparently via `Proxy` + `AsyncLocalStorage`. No compiler, no magic strings.
 > Status: **Phase 1 + 2 implemented** (event-driven worker, durable sleep, per-step
 > retry, hybrid log). Streaming (Phase 3) and polish (Phase 4) are deferred. The
 > runtime is DB-client agnostic; the `agentic` example supplies a Drizzle/porsager
-> client. See `SPEC.md`, and `FEATURE-multi-worker-liveness.md` for the planned
-> advisory-lock liveness design.
+> client. See `SPEC.md`, and `FEATURE-multi-worker-liveness.md` for how
+> dead-worker reclaim works (advisory-lock liveness, no lease to tune).
 
 ## Layout
 

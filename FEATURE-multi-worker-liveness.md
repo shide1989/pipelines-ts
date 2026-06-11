@@ -1,10 +1,11 @@
 # Feature: Multi-Worker Liveness via Postgres Advisory Locks
 
-**Status:** design (v0.2 — amended after review; v0.1 in the project history)
-**Amends:** `SPEC.md` (Component 2 — Worker, §2.1/§2.2). This document is additive; `SPEC.md` is not modified.
-**Replaces (when implemented):** the interim lease+heartbeat reclaim shipped in `worker.ts`/`engine.ts` (`staleRunningMs` + `updated_at` heartbeat). That lease made dead-worker reclaim *work*; this design makes it *precise* — no threshold to tune, no reclaim delay on clean crash.
+**Status:** implemented (v0.3) — `worker.ts` (lock gate + in-flight map + orphan scan), `db.ts` (`reserve()`), both adapters, integration tests
+**Amends:** `SPEC.md` (Component 2 — Worker, §2.1/§2.2 — recovery section updated to match).
+**Replaced:** the interim lease+heartbeat reclaim (`staleRunningMs` + `updated_at` heartbeat). The lease made dead-worker reclaim *work*; this makes it *precise* — no threshold to tune, no reclaim delay on clean crash.
 
 **v0.2 changes:** in-process in-flight set (same-session re-entrancy is a correctness hole, not a nicety); `DatabaseClient` contract extension spelled out; per-worker ownership-connection variant adopted over per-run connections; lease comparison rewritten honestly; test list extended.
+**v0.3 changes (implementation):** the reclaim scan selects candidates with a plain bounded query and takes each lock **per-row on the ownership session** instead of the batched `SELECT pg_try_advisory_lock(...) FROM (subquery)` form — same semantics, and the LIMIT-evaluation-order footgun can't exist when no lock function appears in a SELECT list. Reclaim needs no dedicated code path: *every* execution acquires the lock first, and "lock acquired + row still `running`" is itself the proof the claimer died, so the reset-to-pending happens inline in the one execution path.
 
 ---
 
@@ -114,30 +115,25 @@ execute(row):
 
 ### Reclaiming orphaned runs (the crux)
 
-This is what the lock buys us. The recovery scan (on startup, and periodically) finds rows that *claim* to be executing and tests whether anyone actually is:
+This is what the lock buys us — and as implemented it needs **no dedicated reclaim path**. The recovery scan just feeds `running` rows (orphan *candidates*, bounded batch, oldest `updated_at` first) into the same `execute()` everything else uses:
 
 ```sql
--- NOTE: do NOT write `SELECT pg_try_advisory_lock(...) FROM ... LIMIT n` directly:
--- per the PG docs, LIMIT is not guaranteed to apply before the lock function runs,
--- so locks may be acquired on unintended rows and dangle. Force evaluation order
--- with a subquery, then lock the bounded set.
-SELECT q.id, pg_try_advisory_lock( hashtextextended(q.id::text, 0) ) AS acquired
-FROM (
-  SELECT id
-  FROM workflow_runs
-  WHERE status = 'running'
-    AND id != ALL($1)              -- $1 = this worker's inflightSet (re-entrancy guard)
-  ORDER BY updated_at
-  LIMIT 50
-) q;
+-- recovery scan, the orphan-candidate arm (plain query, no lock functions —
+-- the batched SELECT pg_try_advisory_lock(...) FROM ... form and its
+-- LIMIT-evaluation-order footgun are avoided entirely):
+SELECT id FROM (
+  SELECT id FROM workflow_runs WHERE status = 'running'
+  ORDER BY updated_at LIMIT 50
+) candidates;
 ```
 
-The scan runs **on the ownership connection** (locks must live on the session that survives per-run work) with the in-flight set excluded in SQL *and* re-checked in process. For each returned row:
+`execute()` dedups against the in-flight map synchronously (so a worker never feeds itself its own active runs), then `executeExclusive` takes the lock per-row on the ownership session:
 
-- `acquired = true` → no live session held the lock → the worker that set `running` is dead. Reclaim: this worker now holds the lock, add to the in-flight set, re-execute (replay skips cached steps, the in-doubt `running` step re-runs, execution continues). Release on suspend/terminal as usual.
-- `acquired = false` → a live worker holds it → genuinely executing → skip, and do nothing (we never acquired, so nothing to release).
+- **lock not acquired** → a live session holds it → genuinely executing → skip; nothing to release.
+- **lock acquired and the row is still `running`** → the claimer is dead (a live claimer would hold the lock; same-session doubles are excluded by the in-flight map) → reset the row to `pending` (logged `run.reclaimed`) and fall through to the normal claim + execute. Replay skips cached steps; the in-doubt `running` step re-runs.
+- **lock acquired and the row is `pending`/`suspended`/terminal** → the normal path: claim it (or no-op).
 
-That single `pg_try_advisory_lock` distinguishes *actively-running* from *orphaned-by-a-dead-worker* with no timeout and no heartbeat. Process at most a small bounded batch per pass so locks aren't held on rows you won't immediately execute.
+One `pg_try_advisory_lock` distinguishes *actively-running* from *orphaned-by-a-dead-worker* with no timeout and no heartbeat. Rows beyond the batch wait for the next reconcile pass.
 
 ## Correctness, residuals, and the honest limits
 
@@ -146,25 +142,25 @@ That single `pg_try_advisory_lock` distinguishes *actively-running* from *orphan
 - **The one true double-execution path (fencing).** A worker alive and mid-step (blocked on an LLM HTTP call) whose PG connection drops → lock released → another worker reclaims → both run the step. Nothing time- or connection-based prevents this; the lease has the same ceiling. Mitigations, in order of rigor: (1) at-least-once + idempotency hook — already the documented model, the in-doubt `running` step row makes it detectable; (2) fencing token (deferred) — a per-run `claim_epoch` bumped on reclaim, step writes conditioned on `WHERE claim_epoch = mine`. True exactly-once for arbitrary external side effects remains impossible; this is the honest ceiling for both designs.
 - **Always unlock, but don't depend on it.** Release in `finally`; correctness rests on session-end cleanup, which is the whole point.
 
-## What this changes vs. the current implementation
+## What changed (implemented)
 
-- `worker.ts`: claim and reclaim paths gain the try-lock gate + in-flight set; the `staleRunningMs` lease reclaim and the engine heartbeat are **removed** (the reconciliation scan and the suspended/pending arms stay — they recover *work*, the lock recovers *ownership*).
-- `db.ts`: `DatabaseClient.reserve()` added; both adapters (example + test helper) implement it.
+- `worker.ts`: every execution path gates on the try-lock + in-flight map; the `staleRunningMs` lease reclaim and the engine heartbeat are **removed** (the reconciliation scan and the suspended/pending arms stay — they recover *work*, the lock recovers *ownership*).
+- `db.ts`: `DatabaseClient.reserve()` → `ReservedSession { query, release }`; both adapters (example + test helper) implement it over porsager `sql.reserve()`.
 - **No new columns.** `workflow_runs` is unchanged. (If fencing is later adopted, add a single `claim_epoch INT`.)
 
 ## Observability
 
 Join `pg_locks` (advisory entries) against `workflow_runs` to show which runs are *actually* executing right now (lock held) versus merely marked `running` (possibly orphaned, lock free). More truthful than the status column alone, and free.
 
-## Testing additions
+## Tests (implemented in `packages/runtime/tests/integration.test.ts`, "crash recovery")
 
-- **Dead-worker reclaim:** worker A claims + `running`, kill A's session → another worker's scan acquires → run reclaimed and completes **with cached steps skipped** (the money shot: no re-pay on reclaim).
-- **Active run not stolen:** worker A executing (lock held on A's ownership session) → worker B's scan gets `acquired = false` → B skips; no double-execution.
-- **Own runs not self-stolen:** worker A executing run R → A's *own* reclaim scan must skip R (in-flight set), despite `pg_try_advisory_lock` succeeding re-entrantly on A's session.
-- **Lock released on suspend:** run hits `sleep` → no advisory lock held during the wait (assert via `pg_locks`).
-- **NOTIFY herd:** N workers notified of one run → exactly one acquires and claims; the rest skip.
-- **LIMIT-safety:** the reclaim scan uses the subquery form; assert no locks acquired beyond the bounded batch.
-- **Collision is liveness-only:** force two run ids to the same key (test seam) → they serialize, neither double-executes nor is lost.
+- **Dead-worker reclaim:** a `running` row with no live lock holder → reclaimed instantly on the next scan, completes, `run.reclaimed` logged.
+- **Active run not stolen:** the run's lock held by a separate live session (test helper `holdAdvisoryLock`) → scans skip it across multiple reconcile passes; ending that session (the "death") triggers reclaim on the next pass.
+- **Own runs not self-stolen:** a 700ms step with `reconcileMs: 100` → repeated scans during execution; the in-flight map keeps the worker from re-entrantly stealing its own run (step executes exactly once, no `run.reclaimed`).
+- **Lock released on suspend:** during a durable sleep, `pg_locks` shows zero advisory locks.
+- **NOTIFY herd / concurrent workers:** 3 workers, 8 runs → every step executes exactly once.
+
+Not implemented: the LIMIT-safety test (moot — the per-row form has no lock function in any SELECT list) and the key-collision seam (would require injectable key derivation for a negligible-probability, liveness-only event; revisit if the key fn ever becomes configurable).
 
 ## Out of scope (unchanged from `SPEC.md`)
 

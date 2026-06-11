@@ -253,8 +253,8 @@ The engine executes a single claimed run:
 ```typescript
 function startWorker(
   db: DatabaseClient,
-  options?: { maxTimerSleepMs?: number; reconcileMs?: number; staleRunningMs?: number },
-): { stop: () => Promise<void> }; // stop() drains in-flight executions
+  options?: { maxTimerSleepMs?: number; reconcileMs?: number },
+): { stop: () => Promise<void> }; // stop() drains in-flight executions + releases the ownership session
 ```
 
 It combines two wakeup sources feeding one execution path:
@@ -268,9 +268,9 @@ It combines two wakeup sources feeding one execution path:
 - **Recovery (startup + periodic reconciliation, every `reconcileMs`):** three kinds of strandable run are scanned for and re-processed:
   - `pending` — a `NOTIFY` missed while the worker was down or dropped while up (listener hiccup, notify-queue overflow). `NOTIFY` is a latency optimization; the persisted rows are the durability guarantee.
   - `suspended` with no future timer left to wait on — due, or stuck because a timer was marked `fired` but the resume never landed (poller crash between the two). `sleep()`'s replay check is time-based (`fired OR wake_at <= now()`), so re-claiming is always safe and these states self-heal.
-  - `running` but untouched past `staleRunningMs` — orphaned by a dead worker. The engine heartbeats the run row (`updated_at`) every `staleRunningMs/4` during execution, so a live long-running execution stays fresh; stale rows are reset to `pending` (logged `run.reclaimed`) and re-executed. A worker alive-but-partitioned past the threshold gets double-executed — at-least-once, consistent with the step model above. (A liveness design based on Postgres advisory locks — no timeout to tune — is specced in `FEATURE-multi-worker-liveness.md` as the successor to this lease.)
+  - `running` — orphan *candidates* (bounded batch per pass). Liveness is decided by a per-run **session-level advisory lock**: every execution is gated by `pg_try_advisory_lock(hashtextextended(run_id::text, 0))` held on the worker's single reserved "ownership" connection (`DatabaseClient.reserve()`). A live worker's lock makes the scan skip the run; a dead worker's session is gone — its locks auto-released by Postgres — so acquiring the lock on a `running` row *proves* the claimer died, and the row is reset to `pending` (logged `run.reclaimed`) and re-executed. No lease threshold, no heartbeat; design + trade-offs (re-entrancy, partitions, fencing ceiling) in `FEATURE-multi-worker-liveness.md`. In-process exclusion is a synchronous in-flight map — same-session lock attempts are re-entrant and cannot do that job.
 
-Multiple workers can run concurrently and safely via the single-winner claim; there is no leader election.
+Multiple workers can run concurrently and safely via the advisory-lock gate + single-winner claim; there is no leader election.
 
 ### 2.3 Management API (programmatic)
 

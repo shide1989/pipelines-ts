@@ -1,6 +1,6 @@
 // Public API of the durable runtime.
 
-export type { DatabaseClient, Subscription } from "./db";
+export type { DatabaseClient, ReservedSession, Subscription } from "./db";
 export { FatalError } from "./errors";
 export { getRun, listRuns, replayRun } from "./management";
 export { durable } from "./proxy";

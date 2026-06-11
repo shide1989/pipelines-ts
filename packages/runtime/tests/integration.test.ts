@@ -11,7 +11,7 @@ import { sleep } from "../src/sleep";
 import type { LifecycleError, LifecycleResult } from "../src/types";
 import { startWorker } from "../src/worker";
 import { setDefaultDb, workflow } from "../src/workflow";
-import { resetSchema, testDb, truncateAll, waitFor } from "./helpers";
+import { holdAdvisoryLock, resetSchema, testDb, truncateAll, waitFor } from "./helpers";
 
 const db = testDb();
 
@@ -70,6 +70,19 @@ const fatalWf = workflow(
   { retry: { maxRetries: 3, backoffMs: 5, backoffMultiplier: 1 } },
 );
 
+let slowCalls = 0;
+const slowSteps = durable({
+  crunch: async () => {
+    slowCalls++;
+    await Bun.sleep(700); // long enough for several reconcile passes mid-execution
+    return { ok: true };
+  },
+});
+const slowWf = workflow("test.slow", async () => {
+  await slowSteps.crunch();
+  return "slow-done";
+});
+
 const hooksWf = workflow(
   "test.hooks",
   async (x: { fail: boolean }) => {
@@ -113,6 +126,7 @@ beforeEach(async () => {
   prepareCalls = 0;
   flakyAttempts = 0;
   fatalCalls = 0;
+  slowCalls = 0;
   finishes.length = 0;
   errors.length = 0;
 });
@@ -204,20 +218,82 @@ describe("idempotency", () => {
 describe("crash recovery", () => {
   test("a run stuck 'running' (dead worker) is reclaimed and completes", async () => {
     const sub = await echoWf.run({ v: 4 }); // NOTIFY into the void (no worker yet)
-    // Simulate a worker that claimed the run and died: status 'running', no heartbeat.
+    // A dead worker leaves status 'running' and no advisory lock (its session died).
     await db.query("UPDATE workflow_runs SET status = 'running' WHERE id = $1", [sub.runId]);
-    await Bun.sleep(250); // let the claim go stale past staleRunningMs
 
-    await withWorker(
-      async () => {
-        await waitFor(async () => (await status(sub.runId)) === "completed");
-      },
-      { staleRunningMs: 200 },
-    );
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
 
     const run = await getRun(db, sub.runId);
     expect(run?.output).toBe(8);
     expect(run?.logs?.map((l) => l.eventType)).toContain("run.reclaimed");
+  });
+
+  test("an actively-executing run (lock held by a live session) is not stolen", async () => {
+    const sub = await echoWf.run({ v: 9 });
+    await db.query("UPDATE workflow_runs SET status = 'running' WHERE id = $1", [sub.runId]);
+    const die = await holdAdvisoryLock(sub.runId); // simulate the live claimer
+
+    await withWorker(
+      async () => {
+        await Bun.sleep(500); // several reconcile passes while the lock is held
+        expect(await status(sub.runId)).toBe("running"); // scanned, but not stolen
+        expect((await getRun(db, sub.runId))?.logs?.map((l) => l.eventType)).not.toContain(
+          "run.reclaimed",
+        );
+
+        await die(); // session ends → lock auto-releases → next pass reclaims
+        await waitFor(async () => (await status(sub.runId)) === "completed");
+      },
+      { reconcileMs: 150 },
+    );
+
+    expect((await getRun(db, sub.runId))?.logs?.map((l) => l.eventType)).toContain("run.reclaimed");
+  });
+
+  test("a worker's reclaim scan never steals its own in-flight run", async () => {
+    // Advisory locks are re-entrant within a session, so without in-process
+    // exclusion the scan would "discover" our own active run as an orphan.
+    const sub = await slowWf.run(undefined as never);
+    await withWorker(
+      async () => {
+        await waitFor(async () => (await status(sub.runId)) === "completed", 8000);
+      },
+      { reconcileMs: 100 },
+    ); // scans fire repeatedly during the 700ms step
+
+    expect(slowCalls).toBe(1); // executed exactly once, not re-claimed mid-flight
+    expect((await getRun(db, sub.runId))?.logs?.map((l) => l.eventType)).not.toContain(
+      "run.reclaimed",
+    );
+  });
+
+  test("no advisory lock is held while a run sleeps", async () => {
+    const sub = await sleepWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "suspended");
+      await waitFor(async () => {
+        const rows = await db.query<{ n: number }>(
+          "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory'",
+        );
+        return rows[0]?.n === 0; // suspension released the lock — zero compute, zero locks
+      });
+      await waitFor(async () => (await status(sub.runId)) === "completed", 8000);
+    });
+  });
+
+  test("concurrent workers never double-execute (NOTIFY herd)", async () => {
+    const workers = [1, 2, 3].map(() => startWorker(db, { maxTimerSleepMs: 100 }));
+    try {
+      const subs = await Promise.all(Array.from({ length: 8 }, (_, i) => echoWf.run({ v: i })));
+      for (const s of subs) {
+        await waitFor(async () => (await status(s.runId)) === "completed");
+      }
+      expect(prepareCalls).toBe(8); // every run executed exactly once across 3 workers
+    } finally {
+      await Promise.all(workers.map((w) => w.stop()));
+    }
   });
 
   test("a suspended run whose timer fired without a resume self-heals", async () => {

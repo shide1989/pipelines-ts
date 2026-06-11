@@ -12,21 +12,50 @@ export interface TestDb extends DatabaseClient {
   raw: ReturnType<typeof postgres>;
 }
 
+// porsager: `.unsafe(text, params)` is parameterized; `.unsafe(text)` with no
+// params uses the simple protocol (multi-statement DDL). Same bridge for the
+// pool and for a reserved session (ReservedSql extends Sql).
+const unsafeQuery =
+  (sql: Pick<ReturnType<typeof postgres>, "unsafe">) =>
+  <T>(text: string, params: unknown[] = []) =>
+    (params.length ? sql.unsafe(text, params as never[]) : sql.unsafe(text)) as unknown as Promise<
+      T[]
+    >;
+
 /** A DatabaseClient adapter over porsager — the same shape as the example's wrapper. */
 export function testDb(): TestDb {
   const sql = postgres(TEST_URL, { onnotice: () => {} });
   return {
     raw: sql,
-    query: <T>(text: string, params: unknown[] = []) =>
-      (params.length
-        ? sql.unsafe(text, params as never[])
-        : sql.unsafe(text)) as unknown as Promise<T[]>,
+    query: unsafeQuery(sql),
     listen: async (channel, onNotify) => {
       const { unlisten } = await sql.listen(channel, onNotify);
       return { unlisten };
     },
+    reserve: async () => {
+      const reserved = await sql.reserve();
+      return {
+        query: unsafeQuery(reserved),
+        release: async () => reserved.release(),
+      };
+    },
     close: () => sql.end(),
   };
+}
+
+/**
+ * Acquire the worker's advisory lock for a run on a SEPARATE session —
+ * simulates another live worker actively executing it. The returned function
+ * ends that session, which is exactly how a real worker "dies".
+ */
+export async function holdAdvisoryLock(runId: string): Promise<() => Promise<void>> {
+  const sql = postgres(TEST_URL, { max: 1, onnotice: () => {} });
+  const [row] = await sql`SELECT pg_try_advisory_lock(hashtextextended(${runId}::text, 0)) AS ok`;
+  if (!row?.ok) {
+    await sql.end();
+    throw new Error(`could not acquire test lock for ${runId}`);
+  }
+  return () => sql.end();
 }
 
 /** Drop and re-apply the schema from scratch (clean slate for the suite). */

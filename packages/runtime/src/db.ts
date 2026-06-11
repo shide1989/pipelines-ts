@@ -13,11 +13,24 @@ export interface Subscription {
   unlisten(): Promise<void>;
 }
 
+/**
+ * A single pinned connection pulled out of the pool. Every `query()` runs on
+ * that one connection until `release()`. Required for session-scoped state —
+ * the worker holds its advisory locks on a reserved session so that worker
+ * death (session end) releases them all at once.
+ */
+export interface ReservedSession {
+  query<T = unknown>(text: string, params?: unknown[]): Promise<T[]>;
+  release(): Promise<void>;
+}
+
 export interface DatabaseClient {
   /** Run a `$1,$2,…`-parameterized statement and return the rows. */
   query<T = unknown>(text: string, params?: unknown[]): Promise<T[]>;
   /** Subscribe to a NOTIFY channel; `payload` is the notification string. */
   listen(channel: string, onNotify: (payload: string) => void): Promise<Subscription>;
+  /** Reserve a dedicated session (porsager `sql.reserve()`, node-pg `pool.connect()`). */
+  reserve(): Promise<ReservedSession>;
   /** Close all underlying connections. */
   close(): Promise<void>;
 }

@@ -15,20 +15,33 @@ export interface AgenticDb {
   orm: PostgresJsDatabase<typeof schema>;
 }
 
+// porsager: `.unsafe(text, params)` is parameterized; `.unsafe(text)` with no
+// params uses the simple protocol, which setup()'s multi-statement DDL needs.
+// The same bridge serves the pool and a reserved session (ReservedSql extends Sql).
+const unsafeQuery =
+  (sql: Pick<ReturnType<typeof postgres>, "unsafe">) =>
+  <T>(text: string, params: unknown[] = []) =>
+    (params.length ? sql.unsafe(text, params as never[]) : sql.unsafe(text)) as unknown as Promise<
+      T[]
+    >;
+
 export function createDb(url: string): AgenticDb {
   const sql = postgres(url, { onnotice: () => {} });
   const orm = drizzle(sql, { schema });
 
   const client: DatabaseClient = {
-    // porsager: `.unsafe(text, params)` is parameterized; `.unsafe(text)` with no
-    // params uses the simple protocol, which setup()'s multi-statement DDL needs.
-    query: <T>(text: string, params: unknown[] = []) =>
-      (params.length
-        ? sql.unsafe(text, params as never[])
-        : sql.unsafe(text)) as unknown as Promise<T[]>,
+    query: unsafeQuery(sql),
     listen: async (channel, onNotify) => {
       const { unlisten } = await sql.listen(channel, onNotify);
       return { unlisten };
+    },
+    // Pin one connection for session-scoped state (the worker's advisory locks).
+    reserve: async () => {
+      const reserved = await sql.reserve();
+      return {
+        query: unsafeQuery(reserved),
+        release: async () => reserved.release(),
+      };
     },
     close: () => sql.end(),
   };

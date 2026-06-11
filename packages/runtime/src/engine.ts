@@ -26,16 +26,10 @@ interface ClaimRow {
  * Atomically claim a `pending`/`suspended` run and run it to its next checkpoint
  * or terminal state. No-op if another worker already claimed it (the WHERE guard
  * + row lock make the transition single-winner without explicit transactions).
- *
- * While executing, a heartbeat touches the run row every `heartbeatMs` so the
- * worker's stale-claim reclaim (which keys off `updated_at`) can tell a live
- * long-running execution from one orphaned by a dead worker.
+ * Cross-worker liveness is the worker's job: it gates every call to this with a
+ * per-run advisory lock (see worker.ts).
  */
-export async function claimAndExecute(
-  db: DatabaseClient,
-  runId: string,
-  heartbeatMs = 15_000,
-): Promise<void> {
+export async function claimAndExecute(db: DatabaseClient, runId: string): Promise<void> {
   const claimed = await db.query<ClaimRow>(
     `WITH cur AS (SELECT status FROM workflow_runs WHERE id = $1 FOR UPDATE)
      UPDATE workflow_runs r SET status = 'running'
@@ -70,17 +64,6 @@ export async function claimAndExecute(
     cachedSteps: await loadCachedSteps(db, runId),
   };
 
-  // The WHERE guard makes the heartbeat stop mattering once sleep() suspends
-  // the run; failures are logged but not fatal — a missed beat only narrows the
-  // reclaim margin, and if the DB is down the execution itself fails loudly.
-  const heartbeat = setInterval(() => {
-    void db
-      .query("UPDATE workflow_runs SET updated_at = now() WHERE id = $1 AND status = 'running'", [
-        runId,
-      ])
-      .catch((err) => console.error(`[pipelines] heartbeat failed for ${runId}:`, err));
-  }, heartbeatMs);
-
   try {
     const output = await workflowStorage.run(ctx, () => def.fn(parseJsonb(row.input)));
     await db.query(
@@ -97,8 +80,6 @@ export async function claimAndExecute(
     }
     const message = err instanceof Error ? err.message : String(err);
     await failRun(db, runId, row.workflow_name, message, def);
-  } finally {
-    clearInterval(heartbeat);
   }
 }
 
