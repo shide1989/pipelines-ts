@@ -75,7 +75,7 @@ await resetSchema(db);
 
 // 1. Submission rate (pure INSERT + NOTIFY into the void)
 {
-  const N = 2000;
+  const N = 5000;
   const ms = await submitMany(s1, N);
   console.log(
     `submission      ${fmt((N / ms) * 1000)} runs/sec        (${N} inserts in ${fmt(ms)}ms)`,
@@ -85,7 +85,7 @@ await resetSchema(db);
 
 // 2. Drain 1-step workflows, 1 worker
 {
-  const N = 1000;
+  const N = 3000;
   await submitMany(s1, N);
   const ms = await drain(N, 1);
   console.log(
@@ -96,7 +96,7 @@ await resetSchema(db);
 
 // 3. Drain 10-step workflows, 1 worker
 {
-  const N = 200;
+  const N = 500;
   await submitMany(s10, N);
   const ms = await drain(N, 1);
   console.log(
@@ -108,7 +108,7 @@ await resetSchema(db);
 // 4. Per-run latency on an idle worker (NOTIFY pickup + full execution),
 //    sequential so there is no queueing — this is the floor, not the ceiling.
 {
-  const N = 50;
+  const N = 200;
   const worker = startWorker(db, { reconcileMs: 60_000 });
   await Bun.sleep(200); // let LISTEN come up
   const lat: number[] = [];
@@ -137,7 +137,7 @@ await resetSchema(db);
 
 // 5. Drain 1-step workflows, 3 workers (lock contention included)
 {
-  const N = 1000;
+  const N = 3000;
   await submitMany(s1, N);
   const ms = await drain(N, 3);
   console.log(
@@ -151,7 +151,7 @@ await resetSchema(db);
 //    costs). max=2 is the floor: reserve() takes the ownership session OUT of
 //    the pool, so max=1 starves the worker's queries entirely (deadlock).
 for (const max of [2, 5, 10, 20, 30, 50]) {
-  const N = 600;
+  const N = 1500;
   await submitMany(s1, N);
   const ms = await drain(N, 1, max);
   console.log(
