@@ -160,6 +160,11 @@ Join `pg_locks` (advisory entries) against `workflow_runs` to show which runs ar
 - **Lock released on suspend:** during a durable sleep, `pg_locks` shows zero advisory locks.
 - **NOTIFY herd / concurrent workers:** 3 workers, 8 runs → every step executes exactly once.
 
+And multi-PROCESS (`tests/multiworker.test.ts` + `tests/fixtures/`) — real OS processes spawned via `Bun.spawn`, own sessions, own locks; execution attributed across processes through a side table written at step start (in-memory counters can't cross a process boundary):
+
+- **Burst distribution:** 16 runs over 3 worker processes → exactly-once per run, work spread across ≥2 pids (all workers confirmed listening before submission, or the first one up vacuums the burst).
+- **SIGKILL mid-step:** the claiming process is killed with no cleanup → its session dies, Postgres releases the lock, a *different* surviving process reclaims within a reconcile pass, re-runs the in-doubt step, and completes — `run.reclaimed` logged, two execution rows from two pids. This is the end-to-end proof of the design's thesis.
+
 Not implemented: the LIMIT-safety test (moot — the per-row form has no lock function in any SELECT list) and the key-collision seam (would require injectable key derivation for a negligible-probability, liveness-only event; revisit if the key fn ever becomes configurable).
 
 ## Out of scope (unchanged from `SPEC.md`)
