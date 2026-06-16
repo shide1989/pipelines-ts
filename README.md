@@ -1,6 +1,6 @@
 # pipelines
 
-A minimal durable workflow engine for TypeScript/Bun. Workflows are plain async functions — durable checkpointing, replay, and long-lived timers are handled transparently via `Proxy` + `AsyncLocalStorage`. No compiler, no code generation, no magic strings.
+A minimal durable workflow engine for TypeScript. Workflows are plain async functions — durable checkpointing, replay, and long-lived timers are handled transparently via `Proxy` + `AsyncLocalStorage`. No compiler, no code generation, no magic strings.
 
 PostgreSQL is the only dependency. No Redis, no external queue.
 
