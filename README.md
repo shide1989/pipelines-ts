@@ -1,10 +1,37 @@
 # pipelines
 
-A minimal durable workflow engine for TypeScript. Workflows are plain async functions — durable checkpointing, replay, and long-lived timers are handled transparently via `Proxy` + `AsyncLocalStorage`. No compiler, no code generation, no magic strings.
+Durable workflow engine for TypeScript. Write plain async functions — the engine handles checkpointing, replay, and long-lived timers transparently. No compiler, no code generation, no magic strings.
 
-PostgreSQL is the only dependency. No Redis, no external queue.
+**If you already run Postgres, you have everything you need.** No Redis, no Kafka, no Temporal cluster, no extra infra.
 
-**Status: v0.5.0** — core runtime complete (durable steps, sleep, retry, replay, multi-worker liveness). See `SPEC.md` for the full design.
+---
+
+## The problem
+
+Long-running, multi-step work is fragile. A process restart mid-job means re-running everything from scratch, double-charging APIs, re-sending emails, corrupting state. The usual fixes — queues, crons, status flags in your DB — work until they don't. At scale they become a distributed systems problem you didn't sign up for.
+
+Durable execution is the right abstraction: each step is checkpointed, crashes are transparent, `sleep("7 days")` just works. But the existing options are heavy — Temporal requires its own cluster and a separate build pipeline; Inngest/Windmill are SaaS; DIY on top of a queue is weeks of error-prone glue.
+
+**pipelines** is the small, self-hosted version. PostgreSQL as the durable queue, `Proxy` + `AsyncLocalStorage` to intercept step execution at runtime — no compiler needed. Drop it into any TypeScript project that already has a Postgres connection.
+
+---
+
+## What you get
+
+- **Crash recovery** — a process restart replays from the last completed step, not from scratch. Already-completed steps return their cached result instantly.
+- **Durable sleep** — `await sleep("7 days")` suspends with zero compute and resumes automatically when the timer fires. Survives deploys, restarts, whatever.
+- **Per-step retry** — configurable backoff, `FatalError` for non-retriable failures (bad input, validation failure).
+- **Idempotency keys** — deduplicate submissions at the DB level.
+- **Multi-worker** — run as many workers as you need. Dead worker detection via PostgreSQL advisory locks — no heartbeat to tune, no lease threshold, no separate liveness check.
+- **Replay** — re-run any completed or failed workflow from scratch via the management API.
+- **Observability** — every lifecycle event goes to an append-only `workflow_logs` table. Query it however you want.
+- **No lock-in** — the management API is programmatic and in-process. Wire it to HTTP, a CLI, a queue consumer, a cron — your call.
+
+---
+
+## Status
+
+**v0.5.0** — core runtime complete (durable steps, sleep, retry, replay, multi-worker liveness). See `SPEC.md` for the full design.
 
 ---
 
