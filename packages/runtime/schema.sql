@@ -17,11 +17,14 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   status        run_status NOT NULL DEFAULT 'pending',  -- .run() inserts 'pending'; the worker drives the rest
   error         TEXT,
   idempotency_key TEXT,
+  parent_run_id UUID REFERENCES workflow_runs(id) ON DELETE SET NULL,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- no run-level retry_count: retries are per-step (workflow_steps.attempts)
   UNIQUE (workflow_name, idempotency_key)
 );
+-- Idempotent column addition for existing databases (CREATE TABLE IF NOT EXISTS skips alterations).
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS parent_run_id UUID REFERENCES workflow_runs(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS workflow_steps (
   id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),

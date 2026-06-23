@@ -4,8 +4,8 @@
 // WorkflowContext from AsyncLocalStorage, derives a deterministic step ID
 // ("name:callIndex"), and on cache miss: writes an intent row (status='running'),
 // executes with per-step retry (incrementing `attempts`), guards serializability,
-// persists the result as 'completed', and logs. Falls through to direct execution
-// when there is no active context (steps stay testable outside workflows).
+// persists the result as 'completed', and logs. Throws when called outside a
+// workflow context unless `allowUnbound: true` is set (for scripts/utilities).
 
 import { workflowStorage } from "./context";
 import { assertSerializable, FatalError } from "./errors";
@@ -16,7 +16,7 @@ type AsyncSteps = Record<string, (...args: any[]) => Promise<any>>;
 
 const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-export function durable<T extends AsyncSteps>(steps: T): T {
+export function durable<T extends AsyncSteps>(steps: T, options?: { allowUnbound?: boolean }): T {
   return new Proxy(steps, {
     get(target, prop, receiver) {
       const fn = Reflect.get(target, prop, receiver);
@@ -24,8 +24,11 @@ export function durable<T extends AsyncSteps>(steps: T): T {
 
       return async (...args: unknown[]) => {
         const ctx = workflowStorage.getStore();
-        // No active workflow → call through directly, no checkpointing.
-        if (!ctx) return fn(...args);
+        if (!ctx) {
+          if (!options?.allowUnbound)
+            throw new Error(`step "${prop}" called outside workflow context`);
+          return fn(...args);
+        }
 
         const index = ctx.stepCounters.get(prop) ?? 0;
         ctx.stepCounters.set(prop, index + 1);

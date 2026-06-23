@@ -11,7 +11,7 @@ import { appendLog } from "./log";
 
 export async function sleep(duration: string): Promise<void> {
   const ctx = workflowStorage.getStore();
-  if (!ctx) return; // No active workflow — sleep is a no-op outside a run.
+  if (!ctx) throw new Error("sleep() called outside workflow context");
 
   const sleepId = `sleep:${ctx.sleepCounter++}`;
 

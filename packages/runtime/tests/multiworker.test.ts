@@ -9,7 +9,7 @@ import type { Subprocess } from "bun";
 import { getRun } from "../src/management";
 import { setDefaultDb } from "../src/workflow";
 import { mwWork } from "./fixtures/workflows";
-import { resetSchema, TEST_URL, testDb, truncateAll, waitFor } from "./helpers";
+import { resetSchema, TEST_URL, testDb, waitFor } from "./helpers";
 
 const db = testDb();
 const WORKER_MAIN = new URL("./fixtures/worker-main.ts", import.meta.url).pathname;
@@ -53,7 +53,6 @@ beforeAll(async () => {
        key TEXT NOT NULL, pid INT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
      )`,
   );
-  await truncateAll(db);
   setDefaultDb(db);
   // All workers must be listening BEFORE anything is submitted, otherwise the
   // first one up vacuums the whole burst and the distribution assertion lies.

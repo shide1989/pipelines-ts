@@ -11,7 +11,7 @@ import { sleep } from "../src/sleep";
 import type { LifecycleError, LifecycleResult } from "../src/types";
 import { startWorker } from "../src/worker";
 import { setDefaultDb, workflow } from "../src/workflow";
-import { holdAdvisoryLock, resetSchema, testDb, truncateAll, waitFor } from "./helpers";
+import { holdAdvisoryLock, resetSchema, testDb, waitFor } from "./helpers";
 
 const db = testDb();
 
@@ -122,7 +122,6 @@ afterAll(async () => {
   await db.close();
 });
 beforeEach(async () => {
-  await truncateAll(db);
   prepareCalls = 0;
   flakyAttempts = 0;
   fatalCalls = 0;
@@ -164,18 +163,71 @@ describe("submission + execution", () => {
 });
 
 describe("replay + caching", () => {
-  test("replay re-runs but skips cached steps (no re-execution)", async () => {
+  test("replay creates a new run and skips cached steps (no re-execution)", async () => {
     const sub = await echoWf.run({ v: 5 });
     await withWorker(async () => {
       await waitFor(async () => (await status(sub.runId)) === "completed");
     });
     expect(prepareCalls).toBe(1);
 
+    let replay!: { runId: string };
     await withWorker(async () => {
-      await replayRun(db, sub.runId);
-      await waitFor(async () => (await status(sub.runId)) === "completed");
+      replay = await replayRun(db, sub.runId);
+      expect(replay.runId).not.toBe(sub.runId); // new run, not in-place mutation
+      await waitFor(async () => (await status(replay.runId)) === "completed");
     });
     expect(prepareCalls).toBe(1); // step served from cache, fn not re-invoked
+
+    const replayed = await getRun(db, replay.runId);
+    expect(replayed?.output).toBe(10); // 5*2
+    expect(replayed?.parentRunId).toBe(sub.runId);
+    expect(await status(sub.runId)).toBe("completed"); // original untouched
+  });
+
+  test("replay with useCache:false re-executes all steps", async () => {
+    const sub = await echoWf.run({ v: 5 });
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect(prepareCalls).toBe(1);
+
+    let replay!: { runId: string };
+    await withWorker(async () => {
+      replay = await replayRun(db, sub.runId, { useCache: false });
+      await waitFor(async () => (await status(replay.runId)) === "completed");
+    });
+    expect(prepareCalls).toBe(2); // fn re-invoked — no cache
+    expect((await getRun(db, replay.runId))?.output).toBe(10);
+  });
+
+  test("replay of a failed run resumes from the failure point", async () => {
+    const sub = await flakyWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    expect(flakyAttempts).toBe(3);
+
+    // Force the run into a failed state to simulate a real failure scenario.
+    await db.query("UPDATE workflow_runs SET status = 'failed', error = 'forced' WHERE id = $1", [sub.runId]);
+
+    let replay!: { runId: string };
+    await withWorker(async () => {
+      replay = await replayRun(db, sub.runId);
+      await waitFor(async () => (await status(replay.runId)) === "completed");
+    });
+    // The completed step was cached — fn not re-invoked.
+    expect(flakyAttempts).toBe(3);
+    expect((await getRun(db, replay.runId))?.output).toBe(true);
+    expect((await getRun(db, replay.runId))?.parentRunId).toBe(sub.runId);
+  });
+
+  test("replayRun throws on non-terminal status", async () => {
+    const sub = await echoWf.run({ v: 1 });
+    await expect(replayRun(db, sub.runId)).rejects.toThrow(/not replayable/);
+  });
+
+  test("replayRun throws on unknown run id", async () => {
+    await expect(replayRun(db, "00000000-0000-0000-0000-000000000000")).rejects.toThrow(/not found/);
   });
 });
 
@@ -228,7 +280,9 @@ describe("idempotency", () => {
     const a = await echoWf.run({ v: 1 }, { idempotencyKey: "k1" });
     const b = await echoWf.run({ v: 999 }, { idempotencyKey: "k1" });
     expect(b.runId).toBe(a.runId);
-    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_runs");
+    const rows = await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = 'k1'",
+    );
     expect(rows[0]?.n).toBe(1);
   });
 
@@ -237,7 +291,9 @@ describe("idempotency", () => {
       Array.from({ length: 10 }, () => echoWf.run({ v: 1 }, { idempotencyKey: "race" })),
     );
     expect(new Set(subs.map((s) => s.runId)).size).toBe(1);
-    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_runs");
+    const rows = await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = 'race'",
+    );
     expect(rows[0]?.n).toBe(1);
   });
 });
@@ -293,7 +349,9 @@ describe("crash recovery", () => {
       { reconcileMs: 150 },
     );
 
-    expect((await getRun(db, sub.runId))?.logs?.map((l) => l.eventType)).toContain("run.reclaimed");
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe(18);
+    expect(run?.logs?.map((l) => l.eventType)).toContain("run.reclaimed");
   });
 
   test("a worker's reclaim scan never steals its own in-flight run", async () => {
@@ -307,10 +365,10 @@ describe("crash recovery", () => {
       { reconcileMs: 100 },
     ); // scans fire repeatedly during the 700ms step
 
+    const run = await getRun(db, sub.runId);
     expect(slowCalls).toBe(1); // executed exactly once, not re-claimed mid-flight
-    expect((await getRun(db, sub.runId))?.logs?.map((l) => l.eventType)).not.toContain(
-      "run.reclaimed",
-    );
+    expect(run?.output).toBe("slow-done");
+    expect(run?.logs?.map((l) => l.eventType)).not.toContain("run.reclaimed");
   });
 
   test("no advisory lock is held while a run sleeps", async () => {
@@ -325,6 +383,7 @@ describe("crash recovery", () => {
       });
       await waitFor(async () => (await status(sub.runId)) === "completed", 8000);
     });
+    expect((await getRun(db, sub.runId))?.output).toBe("done");
   });
 
   test("concurrent workers never double-execute (NOTIFY herd)", async () => {
@@ -401,11 +460,19 @@ describe("lifecycle hooks", () => {
 });
 
 describe("outside a workflow", () => {
+  const unboundSteps = durable({
+    prepare: async (x: { v: number }) => {
+      prepareCalls++;
+      return { doubled: x.v * 2 };
+    },
+  }, { allowUnbound: true });
+
   test("a durable step runs directly with no checkpointing", async () => {
-    const r = await echoSteps.prepare({ v: 21 });
+    const [before] = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_steps");
+    const r = await unboundSteps.prepare({ v: 21 });
     expect(r).toEqual({ doubled: 42 });
     expect(prepareCalls).toBe(1);
-    const rows = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_steps");
-    expect(rows[0]?.n).toBe(0); // nothing persisted
+    const [after] = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM workflow_steps");
+    expect(after?.n).toBe(before?.n); // nothing persisted
   });
 });

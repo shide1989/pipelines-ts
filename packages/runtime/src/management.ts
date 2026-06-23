@@ -9,7 +9,7 @@ import { parseJsonb } from "./json";
 import type { LogEntry, RunSubmission, StepResult, WorkflowRun } from "./types";
 
 const RUN_COLUMNS = `id, workflow_name, input::text AS input, output::text AS output,
-   status, error, idempotency_key, created_at, updated_at`;
+   status, error, idempotency_key, parent_run_id, created_at, updated_at`;
 
 /** Full run detail: the run row plus its steps and ordered log trail. */
 export async function getRun(db: DatabaseClient, runId: string): Promise<WorkflowRun | null> {
@@ -51,26 +51,44 @@ export async function listRuns(
 }
 
 /**
- * Force re-execution of a completed/failed run: reset it to 'pending' and notify
- * a worker. Completed steps stay cached, so a failed run retries from its failed
- * step (its row isn't 'completed'), not from scratch.
+ * Replay a terminal run by creating a new run with the same workflow + input.
+ * The original run is left untouched (immutable record). By default, completed
+ * steps are copied into the new run so execution resumes from the failure point
+ * rather than from scratch. Pass `{ useCache: false }` to start fresh.
  */
-export async function replayRun(db: DatabaseClient, runId: string): Promise<RunSubmission> {
-  const reset = await db.query<{ status: WorkflowRun["status"] }>(
-    "UPDATE workflow_runs SET status = 'pending', error = NULL WHERE id = $1 AND status IN ('completed', 'failed') RETURNING status",
-    [runId],
-  );
-  if (!reset[0]) {
-    const cur = await db.query<{ status: WorkflowRun["status"] }>(
-      "SELECT status FROM workflow_runs WHERE id = $1",
+export async function replayRun(
+  db: DatabaseClient,
+  runId: string,
+  options?: { useCache?: boolean },
+): Promise<RunSubmission> {
+  const orig = (
+    await db.query<{ status: WorkflowRun["status"]; workflow_name: string; input: string }>(
+      "SELECT status, workflow_name, input::text AS input FROM workflow_runs WHERE id = $1",
       [runId],
+    )
+  )[0];
+  if (!orig) throw new Error(`Run not found: ${runId}`);
+  if (orig.status !== "completed" && orig.status !== "failed")
+    throw new Error(`Run ${runId} is not replayable (status: ${orig.status})`);
+
+  const [newRun] = await db.query<{ id: string }>(
+    `INSERT INTO workflow_runs (workflow_name, input, parent_run_id, status)
+     VALUES ($1, $2::text::jsonb, $3, 'pending') RETURNING id`,
+    [orig.workflow_name, orig.input, runId],
+  );
+  if (!newRun) throw new Error(`Failed to create replay run for ${runId}`);
+
+  if (options?.useCache !== false) {
+    await db.query(
+      `INSERT INTO workflow_steps (run_id, step_id, status, output, attempts)
+       SELECT $2, step_id, status, output, attempts
+       FROM workflow_steps WHERE run_id = $1 AND status = 'completed'`,
+      [runId, newRun.id],
     );
-    if (!cur[0]) throw new Error(`Run not found: ${runId}`);
-    return { runId, status: cur[0].status }; // not in a replayable state — return as-is
   }
-  // UPDATE doesn't fire the AFTER-INSERT notify trigger, so wake a worker explicitly.
-  await db.query("SELECT pg_notify('workflow_runs', $1)", [runId]);
-  return { runId, status: "pending" };
+
+  // The INSERT trigger fires pg_notify automatically — no explicit notify needed.
+  return { runId: newRun.id, status: "pending" };
 }
 
 // --- Row mapping ------------------------------------------------------------
@@ -83,6 +101,7 @@ interface RunRow {
   status: WorkflowRun["status"];
   error: string | null;
   idempotency_key: string | null;
+  parent_run_id: string | null;
   created_at: string | Date;
   updated_at: string | Date;
 }
@@ -113,6 +132,7 @@ export function mapRun<R = unknown>(row: RunRow): WorkflowRun<R> {
     status: row.status,
     error: row.error ?? undefined,
     idempotencyKey: row.idempotency_key ?? undefined,
+    parentRunId: row.parent_run_id ?? undefined,
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };

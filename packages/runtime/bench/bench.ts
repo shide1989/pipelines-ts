@@ -110,7 +110,7 @@ await resetSchema(db);
 {
   const N = 200;
   const worker = startWorker(db, { reconcileMs: 60_000 });
-  await Bun.sleep(200); // let LISTEN come up
+  await new Promise((r) => setTimeout(r, 200)); // let LISTEN come up
   const lat: number[] = [];
   for (let i = 0; i < N; i++) {
     const t0 = performance.now();

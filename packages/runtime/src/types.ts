@@ -15,6 +15,7 @@ export interface WorkflowRun<R = unknown> {
   status: WorkflowStatus;
   error?: string;
   idempotencyKey?: string;
+  parentRunId?: string;
   createdAt: Date;
   updatedAt: Date;
   // Populated by getRun() (the detail view), omitted by listRuns().

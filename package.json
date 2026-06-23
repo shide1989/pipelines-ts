@@ -5,6 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@11.5.1",
   "scripts": {
+    "db:clean": "docker compose exec postgres psql -U pipelines -c 'TRUNCATE workflow_runs, workflow_steps, workflow_timers, workflow_logs RESTART IDENTITY CASCADE'",
     "format": "biome format --write .",
     "lint": "biome lint .",
     "check": "biome check --write .",
