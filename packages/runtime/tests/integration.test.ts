@@ -180,6 +180,33 @@ describe("replay + caching", () => {
 });
 
 describe("durable sleep", () => {
+  test("re-executing a run that crashed before suspending does not duplicate the timer", async () => {
+    const sub = await sleepWf.run(undefined as never);
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "suspended");
+    });
+
+    // Simulate crash: timer row exists but the suspend didn't commit.
+    await db.query("UPDATE workflow_runs SET status = 'running' WHERE id = $1", [sub.runId]);
+
+    await withWorker(async () => {
+      await waitFor(
+        async () => {
+          const s = await status(sub.runId);
+          return s === "suspended" || s === "completed";
+        },
+        8000,
+      );
+    });
+
+    const [row] = await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM workflow_timers WHERE run_id = $1",
+      [sub.runId],
+    );
+    expect(row?.n).toBe(1); // ON CONFLICT DO NOTHING — no duplicate
+  });
+
   test("suspends on sleep, then an adaptive worker resumes to completion", async () => {
     const sub = await sleepWf.run(undefined as never);
 
@@ -216,6 +243,23 @@ describe("idempotency", () => {
 });
 
 describe("crash recovery", () => {
+  test("a run whose workflow is not registered fails the run with a clear error", async () => {
+    const [row] = await db.query<{ id: string }>(
+      `INSERT INTO workflow_runs (workflow_name, input, idempotency_key, status)
+       VALUES ('ghost.workflow', 'null'::jsonb, gen_random_uuid()::text, 'pending')
+       RETURNING id`,
+    );
+    const runId = row!.id;
+
+    await withWorker(async () => {
+      await waitFor(async () => (await status(runId)) === "failed");
+    });
+
+    const run = await getRun(db, runId);
+    expect(run?.error).toMatch(/not registered/);
+    expect(run?.logs?.map((l) => l.eventType)).toContain("run.failed");
+  });
+
   test("a run stuck 'running' (dead worker) is reclaimed and completes", async () => {
     const sub = await echoWf.run({ v: 4 }); // NOTIFY into the void (no worker yet)
     // A dead worker leaves status 'running' and no advisory lock (its session died).
