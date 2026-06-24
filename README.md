@@ -250,6 +250,10 @@ workflow("myWorkflow", fn, {
 
 - **Step results must be JSON-serializable.** `Date` objects become strings after a sleep; `Map`/`Set` become `{}`. The runtime fails fast with a clear error on non-serializable returns rather than silent replay corruption.
 - **Step order must be stable across replays.** Reordering or removing steps while runs are in-flight breaks replay for those runs. Adding steps at the end is safe.
+- **No `sleep()` inside a `Promise.all` branch.** `SleepInterrupt` exits the engine and releases the advisory lock while sibling branches are still executing — a second worker can pick up the suspended run concurrently. Plain `Promise.all` over durable steps (no sleep) is safe.
+- **Workflows must be imported in the worker process.** The registry is in-process; the worker resolves runs by name at runtime. Import all workflow modules before calling `startWorker` or runs will fail with "not registered".
+- **Direct Postgres connection required.** The worker uses advisory locks and `LISTEN/NOTIFY`, both session-scoped. Transaction-mode poolers (PgBouncer, Supavisor) silently break both. On Supabase, use port 5432, not 6543.
+- **Requires PostgreSQL 13+.** Uses `gen_random_uuid()`, `hashtextextended()`, and `GENERATED ALWAYS AS IDENTITY`.
 - **`bun:sql` cannot receive `NOTIFY`.** Use `porsager/postgres` or `node-postgres`.
 - **Pool size ≥ 2.** The worker reserves one connection permanently for advisory locks.
 

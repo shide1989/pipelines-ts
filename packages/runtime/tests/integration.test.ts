@@ -277,22 +277,26 @@ describe("durable sleep", () => {
 
 describe("idempotency", () => {
   test("same key returns the same run, inserts once", async () => {
-    const a = await echoWf.run({ v: 1 }, { idempotencyKey: "k1" });
-    const b = await echoWf.run({ v: 999 }, { idempotencyKey: "k1" });
+    const key = crypto.randomUUID();
+    const a = await echoWf.run({ v: 1 }, { idempotencyKey: key });
+    const b = await echoWf.run({ v: 999 }, { idempotencyKey: key });
     expect(b.runId).toBe(a.runId);
     const rows = await db.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = 'k1'",
+      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = $1",
+      [key],
     );
     expect(rows[0]?.n).toBe(1);
   });
 
   test("concurrent same-key submits race to one run, none throws", async () => {
+    const key = crypto.randomUUID();
     const subs = await Promise.all(
-      Array.from({ length: 10 }, () => echoWf.run({ v: 1 }, { idempotencyKey: "race" })),
+      Array.from({ length: 10 }, () => echoWf.run({ v: 1 }, { idempotencyKey: key })),
     );
     expect(new Set(subs.map((s) => s.runId)).size).toBe(1);
     const rows = await db.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = 'race'",
+      "SELECT count(*)::int AS n FROM workflow_runs WHERE idempotency_key = $1",
+      [key],
     );
     expect(rows[0]?.n).toBe(1);
   });
@@ -456,6 +460,87 @@ describe("lifecycle hooks", () => {
     expect(finishes.map((f) => f.status).sort()).toEqual(["completed", "failed"]);
     expect(errors).toHaveLength(1);
     expect(errors[0]?.error).toContain("boom");
+  });
+});
+
+describe("Promise.all (forbidden — undefined behavior)", () => {
+  let leftCalls = 0;
+  let rightCalls = 0;
+  beforeEach(() => { leftCalls = 0; rightCalls = 0; });
+
+  const parallelSteps = durable({
+    left: async () => { leftCalls++; return "L"; },
+    right: async () => { rightCalls++; return "R"; },
+  });
+
+  const parallelWf = workflow("test.parallel", async () => {
+    const [l, r] = await Promise.all([parallelSteps.left(), parallelSteps.right()]);
+    return `${l}${r}`;
+  });
+
+  test("nominal: step IDs are deterministic, output is correct", async () => {
+    const sub = await parallelWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe("LR");
+    expect(run?.steps?.map((s) => s.stepId).sort()).toEqual(["left:0", "right:0"]);
+    expect(leftCalls).toBe(1);
+    expect(rightCalls).toBe(1);
+  });
+
+  test("crash recovery: left completed, right in-doubt — right re-executes once, left served from cache", async () => {
+    // Submit but don't start a worker yet — run stays pending.
+    const sub = await parallelWf.run(undefined as never);
+
+    // Simulate crash state: run was claimed (running), left:0 completed, right:0 in-doubt.
+    await db.query("UPDATE workflow_runs SET status = 'running' WHERE id = $1", [sub.runId]);
+    await db.query(
+      `INSERT INTO workflow_steps (run_id, step_id, status, output, attempts)
+       VALUES ($1, 'left:0', 'completed', '"L"'::jsonb, 1)`,
+      [sub.runId],
+    );
+    await db.query(
+      `INSERT INTO workflow_steps (run_id, step_id, status, attempts)
+       VALUES ($1, 'right:0', 'running', 1)`,
+      [sub.runId],
+    );
+
+    // Worker reclaims the orphaned run (no advisory lock held = dead worker).
+    await withWorker(async () => {
+      await waitFor(async () => (await status(sub.runId)) === "completed");
+    });
+
+    const run = await getRun(db, sub.runId);
+    expect(run?.output).toBe("LR");
+    // left:0 was cached → fn not re-invoked. right:0 was in-doubt → re-executed once.
+    expect(leftCalls).toBe(0);
+    expect(rightCalls).toBe(1);
+  });
+
+  // sleep() inside Promise.all: SleepInterrupt exits the engine and releases the
+  // advisory lock while the other branch may still be writing in the background.
+  // Works when the side step is faster than the sleep (commits before timer fires),
+  // but races when the step is slow — two workers can execute the same run concurrently.
+  const sleepParallelSteps = durable({ side: async () => "side" });
+  const sleepParallelWf = workflow("test.parallel.sleep", async () => {
+    await Promise.all([sleep("1 second"), sleepParallelSteps.side()]);
+    return "done";
+  });
+
+  test("sleep inside Promise.all: safe when side step is fast, race when slow", async () => {
+    const sub = await sleepParallelWf.run(undefined as never);
+    await withWorker(async () => {
+      await waitFor(
+        async () => {
+          const s = await status(sub.runId);
+          return s === "completed" || s === "failed";
+        },
+        8000,
+      );
+    });
+    expect((await getRun(db, sub.runId))?.status).toBe("completed");
   });
 });
 
