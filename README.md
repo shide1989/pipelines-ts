@@ -1,16 +1,21 @@
 # pipelines
 
-Durable workflow engine for TypeScript. Write plain async functions — the engine handles checkpointing, replay, and long-lived timers transparently. No compiler, no code generation, no magic strings.
+Durable workflow engine for TypeScript. 
+Write plain async functions, the engine handles checkpointing, replay, and long-lived timers transparently. No SWC compiler, no code generation, no magic strings.
 
 **If you already run Postgres, you have everything you need.** No Redis, no Kafka, no Temporal cluster, no extra infra.
+
+*Keep in mind that this is still an alpha version, although it is being extensively tested through integration tests and E2E tests.*
 
 ---
 
 ## The problem
 
-Long-running, multi-step work is fragile. A process restart mid-job means re-running everything from scratch, double-charging APIs, re-sending emails, corrupting state. The usual fixes — queues, crons, status flags in your DB — work until they don't. At scale they become a distributed systems problem you didn't sign up for.
+Long-running, multi-step work is fragile. A process restart mid-job means re-running everything from scratch, double-charging APIs, re-sending emails, corrupting state. 
+The usual fixes -> queues, crons, status flags in your DB; work until they don't. 
+At scale they become a distributed systems problem you didn't sign up for.
 
-Durable execution is the right abstraction: each step is checkpointed, crashes are transparent, `sleep("7 days")` just works. But the existing options are heavy — Temporal requires its own cluster and a separate build pipeline; Inngest/Windmill are SaaS; DIY on top of a queue is weeks of error-prone glue.
+Durable execution is the right abstraction: each step is checkpointed, crashes are transparent, `sleep("7 days")` just works. But the existing other options are heavy: Temporal requires its own cluster and a separate build pipeline for you to maintain; Inngest/Windmill are SaaS; DIY on top of a queue is weeks of error-prone glue.
 
 **pipelines** is the small, self-hosted version. PostgreSQL as the durable queue, `Proxy` + `AsyncLocalStorage` to intercept step execution at runtime — no compiler needed. Drop it into any TypeScript project that already has a Postgres connection.
 
@@ -45,41 +50,100 @@ The run rows in Postgres _are_ the durable queue. `NOTIFY` is a latency optimiza
 
 ---
 
+## Installation
+
+```bash
+pnpm add pipelines postgres
+# npm install pipelines postgres
+# yarn add pipelines postgres
+```
+
+---
+
 ## Quick start
 
 ```bash
-docker compose up -d          # Postgres on :5432, schema auto-applied
+docker compose up -d          # Postgres on :5432 for local dev
 ```
 
 ```typescript
+import postgres from "postgres";
 import { durable, setup, setDefaultDb, sleep, startWorker, workflow } from "pipelines";
+import type { DatabaseClient } from "pipelines";
 
-// 1. Wire your DB driver to the runtime's interface (see "Database adapter" below)
-const client = makeClient(/* your postgres driver */);
+// 1. Create a DatabaseClient adapter for your driver (porsager/postgres shown)
+//    On Supabase: use the direct connection URL (port 5432), not the transaction
+//    pooler (port 6543) — LISTEN and session locks don't work over a pooler.
+const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 
+const client: DatabaseClient = {
+  query: (text, params = []) =>
+    params.length ? sql.unsafe(text, params as never[]) : sql.unsafe(text),
+  listen: async (channel, onNotify) => {
+    const { unlisten } = await sql.listen(channel, onNotify);
+    return { unlisten };
+  },
+  reserve: async () => {
+    const reserved = await sql.reserve();
+    return {
+      query: (text, params = []) =>
+        params.length ? reserved.unsafe(text, params as never[]) : reserved.unsafe(text),
+      release: () => reserved.release(),
+    };
+  },
+  close: () => sql.end(),
+};
+
+// 2. Boot
 await setup(client);       // idempotent — creates tables, triggers, indexes
-setDefaultDb(client);      // workflow().run() uses this by default
-startWorker(client);       // LISTEN + adaptive timer poll + startup recovery
+setDefaultDb(client);      // workflow().run() uses this client by default
+startWorker(client);       // starts the execution loop — keep this process alive
 
-// 2. Define steps
+// 3. Define steps — each is checkpointed; a crash replays from the last completed one
 const steps = durable({
-  createUser: async (email: string) => ({ id: crypto.randomUUID(), email }),
-  sendWelcome: async (email: string) => ({ sentTo: email }),
-  sendCheckIn: async (email: string) => ({ sentTo: email }),
+  // Fetch context once — cached on replay, never re-fetched
+  fetchContext: async (docId: string) => {
+    const doc = await db.documents.findById(docId);
+    return { content: doc.content };
+  },
+
+  // Submit a batch inference job — cached on replay, never double-submitted
+  submitInference: async (input: { prompt: string; context: string }) => {
+    const { jobId } = await openai.batches.create({ messages: [{ role: "user", content: `${input.context}\n\n${input.prompt}` }] });
+    return { jobId };
+  },
+
+  // Poll job status — retried automatically on transient failures
+  checkInference: async ({ jobId }: { jobId: string }) => {
+    return await openai.batches.retrieve(jobId); // { status, output }
+  },
+
+  validateOutput: async ({ output }: { output: string }) => {
+    if (!output?.trim()) throw new FatalError("empty LLM output"); // skips retries
+    return { output };
+  },
 });
 
-// 3. Define a workflow
-export const onboard = workflow("onboard", async (email: string) => {
-  const user = await steps.createUser(email);
-  await steps.sendWelcome(email);
-  await sleep("7 days");         // suspends, zero compute, survives restarts
-  await steps.sendCheckIn(email);
-  return { userId: user.id };
+// 4. Define the workflow
+export const runAgentTask = workflow("runAgentTask", async (task: { prompt: string; docId: string }) => {
+  const { content } = await steps.fetchContext(task.docId);
+  const { jobId }   = await steps.submitInference({ prompt: task.prompt, context: content });
+
+  // Durable polling loop: zero compute while sleeping, survives restarts at any duration
+  let result = await steps.checkInference({ jobId });
+  while (result.status !== "completed") {
+    await sleep("30 seconds");
+    result = await steps.checkInference({ jobId });
+  }
+
+  return await steps.validateOutput({ output: result.output });
 });
 
-// 4. Submit a run (returns immediately, executes in the worker)
-const { runId } = await onboard.run("alice@example.com");
+// 5. Submit a run — returns immediately, executes in the worker
+const { runId } = await runAgentTask.run({ prompt: "Summarise risks", docId: "doc_42" });
 ```
+
+> **Serverless / edge**: the worker is a long-running loop and cannot run in a serverless function. Run it in a dedicated process (a Node.js server, a container, a VM) and submit runs from your serverless handlers via the management API.
 
 ---
 
@@ -161,6 +225,8 @@ On startup it scans for pending, due-suspended, and orphaned runs whose worker d
 
 **Pool sizing**: the worker reserves one dedicated connection for its advisory locks. Size your pool at `≥ 2` or the worker's own queries starve.
 
+**Production pattern**: run the worker in a dedicated long-lived process, separate from your HTTP server. Your API handlers submit runs via `workflow().run()` and query state via the management API — they don't need a worker running alongside them, only access to the same Postgres database.
+
 ### Management API
 
 ```typescript
@@ -189,6 +255,8 @@ await setup(client, customSchemaSql);   // override (useful in tests)
 
 Sets the default `DatabaseClient` used by `workflow().run()`. Call once at startup before submitting any runs.
 
+The management API (`getRun`, `listRuns`, `replayRun`) takes an explicit `db` argument instead — so it can be called from any process that has a database connection, not just the one where `setDefaultDb` was called.
+
 ### `FatalError`
 
 Throw from a step to fail the run immediately, skipping retries.
@@ -208,12 +276,11 @@ const steps = durable({
 
 ## Database adapter
 
-The runtime never imports a concrete driver. You supply a thin adapter that maps your driver onto `DatabaseClient`:
+The runtime never imports a concrete driver. You supply a thin adapter that maps your driver onto `DatabaseClient` — the quick start above shows the full adapter for `porsager/postgres`.
+
+The interface contract:
 
 ```typescript
-import type { DatabaseClient } from "pipelines";
-
-// The interface you need to satisfy:
 interface DatabaseClient {
   query<T>(text: string, params?: unknown[]): Promise<T[]>;
   listen(channel: string, onNotify: (payload: string) => void): Promise<{ unlisten(): Promise<void> }>;
@@ -222,9 +289,7 @@ interface DatabaseClient {
 }
 ```
 
-See `examples/agentic/db.ts` for a complete adapter using `porsager/postgres`.
-
-**Driver note**: `bun:sql` cannot receive `NOTIFY`. Use `porsager/postgres` (or `node-postgres`) as your driver. `porsager`'s `sql.unsafe(text, params)` is parameterized; `sql.unsafe(text)` (no params) uses the simple protocol, which `setup()`'s multi-statement DDL requires — handle both cases in your adapter.
+**Driver note**: `bun:sql` cannot receive `NOTIFY`. Use `porsager/postgres` (or `node-postgres`). `porsager`'s `sql.unsafe(text, params)` is parameterized; `sql.unsafe(text)` (no params) uses the simple protocol, which `setup()`'s multi-statement DDL requires — handle both cases in your adapter (as shown in the quick start).
 
 ---
 
