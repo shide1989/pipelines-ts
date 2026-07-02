@@ -6,7 +6,7 @@
 // receive NOTIFY). `orm` is exposed for typed reads in the server.
 
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import type { DatabaseClient } from "pipelines";
+import type { DatabaseClient } from "pipelines-ts";
 import postgres from "postgres";
 import * as schema from "./schema";
 

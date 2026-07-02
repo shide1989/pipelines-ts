@@ -1,5 +1,5 @@
 {
-  "name": "pipelines",
+  "name": "pipelines-ts",
   "version": "0.5.0",
   "type": "module",
   "exports": {

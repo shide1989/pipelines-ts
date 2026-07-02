@@ -1,7 +1,7 @@
 // Minimal hello-world: the durable-sleep feature in isolation.
 // signup → welcome email → 7-day sleep → check-in.
 
-import { durable, sleep, workflow } from "pipelines";
+import { durable, sleep, workflow } from "pipelines-ts";
 
 const steps = durable({
   createUser: async (email: string) => {

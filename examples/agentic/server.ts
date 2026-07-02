@@ -3,7 +3,7 @@
 // Uses Bun's native `routes` (typed `req.params`) — no manual path parsing.
 
 import { desc, eq } from "drizzle-orm";
-import { getRun, replayRun, setDefaultDb, setup, startWorker } from "pipelines";
+import { getRun, replayRun, setDefaultDb, setup, startWorker } from "pipelines-ts";
 import { createDb } from "./db";
 import { workflowRuns } from "./schema";
 import { processTask, type Task } from "./workflow";

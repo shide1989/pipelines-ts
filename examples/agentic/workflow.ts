@@ -2,7 +2,7 @@
 // Exercises every core feature: step caching, durable sleep, per-method counters,
 // retry, and replay (a crash after inference replays the cached result, not a re-pay).
 
-import { durable, FatalError, sleep, workflow } from "pipelines";
+import { checkpoint, FatalError, sleep, workflow } from "pipelines-ts";
 import { llm, loadDocs } from "./clients";
 
 /** processTask input — the single definition the server's cast points at too. */
@@ -11,7 +11,7 @@ export interface Task {
   docId: string;
 }
 
-const steps = durable({
+const steps = checkpoint({
   prepareContext: async (task: Task) => {
     const context = await loadDocs(task.docId); // fetch + assemble context window
     return { prompt: task.prompt, context };

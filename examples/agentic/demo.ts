@@ -5,7 +5,7 @@
 //   docker compose up -d
 //   bun run examples/agentic/demo.ts
 
-import type { WorkflowRun } from "pipelines";
+import type { WorkflowRun } from "pipelines-ts";
 
 const BASE = "http://localhost:3000";
 
