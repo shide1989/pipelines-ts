@@ -53,9 +53,9 @@ The run rows in Postgres _are_ the durable queue. `NOTIFY` is a latency optimiza
 ## Installation
 
 ```bash
-pnpm add pipelines postgres
-# npm install pipelines postgres
-# yarn add pipelines postgres
+pnpm add pipelines-ts postgres
+# npm install pipelines-ts postgres
+# yarn add pipelines-ts postgres
 ```
 
 ---
@@ -68,8 +68,8 @@ docker compose up -d          # Postgres on :5432 for local dev
 
 ```typescript
 import postgres from "postgres";
-import { checkpoint, setup, setDefaultDb, sleep, startWorker, workflow } from "pipelines";
-import type { DatabaseClient } from "pipelines";
+import { checkpoint, setup, setDefaultDb, sleep, startWorker, workflow } from "pipelines-ts";
+import type { DatabaseClient } from "pipelines-ts";
 
 // 1. Create a DatabaseClient adapter for your driver (porsager/postgres shown)
 //    On Supabase: use the direct connection URL (port 5432), not the transaction
@@ -230,7 +230,7 @@ On startup it scans for pending, due-suspended, and orphaned runs whose worker d
 ### Management API
 
 ```typescript
-import { getRun, listRuns, replayRun } from "pipelines";
+import { getRun, listRuns, replayRun } from "pipelines-ts";
 
 // Full run detail: run row + steps + ordered log trail
 const run = await getRun(db, runId);
@@ -262,7 +262,7 @@ The management API (`getRun`, `listRuns`, `replayRun`) takes an explicit `db` ar
 Throw from a step to fail the run immediately, skipping retries.
 
 ```typescript
-import { FatalError } from "pipelines";
+import { FatalError } from "pipelines-ts";
 
 const steps = checkpoint({
   validate: async (output: string) => {
