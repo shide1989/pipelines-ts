@@ -2,10 +2,40 @@
   "name": "pipelines-ts",
   "version": "0.5.0",
   "type": "module",
+  "description": "Durable workflow runtime with replayable, idempotent steps.",
+  "license": "MIT",
+  "author": "Sebastien Hideux",
+  "repository": {
+    "type": "git",
+    "url": "github:shide1989/pipelines-ts"
+  },
+  "keywords": [
+    "workflow",
+    "durable",
+    "runtime",
+    "pipelines",
+    "typescript"
+  ],
   "exports": {
     ".": "./src/index.ts"
   },
-  "dependencies": {
-    "@pipelines/runtime": "workspace:*"
-  }
+  "scripts": {
+    "build": "tsup"
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
+      }
+    },
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "files": [
+      "dist"
+    ]
+  },
+  "files": [
+    "dist"
+  ]
 }

@@ -3,7 +3,7 @@
 export type { DatabaseClient, ReservedSession, Subscription } from "./db";
 export { FatalError } from "./errors";
 export { getRun, listRuns, replayRun } from "./management";
-export { durable } from "./proxy";
+export { checkpoint } from "./proxy";
 export { setup } from "./setup";
 export { parseDuration, sleep } from "./sleep";
 export type {

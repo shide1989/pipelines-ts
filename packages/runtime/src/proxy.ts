@@ -1,12 +1,3 @@
-// durable() — Proxy-based step wrapper.
-//
-// The `get` trap captures the method name (step ID base), reads the active
-// WorkflowContext from AsyncLocalStorage, derives a deterministic step ID
-// ("name:callIndex"), and on cache miss: writes an intent row (status='running'),
-// executes with per-step retry (incrementing `attempts`), guards serializability,
-// persists the result as 'completed', and logs. Throws when called outside a
-// workflow context unless `allowUnbound: true` is set (for scripts/utilities).
-
 import { workflowStorage } from "./context";
 import { assertSerializable, FatalError } from "./errors";
 import { toJsonb } from "./json";
@@ -16,7 +7,16 @@ type AsyncSteps = Record<string, (...args: any[]) => Promise<any>>;
 
 const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-export function durable<T extends AsyncSteps>(steps: T, options?: { allowUnbound?: boolean }): T {
+/**
+ * checkpoint() — Proxy-based step wrapper, that saves each step as a state so you can resume it later.
+ *
+ * The `get` trap captures the method name (step ID base), reads the active WorkflowContext from AsyncLocalStorage,
+ * derives a deterministic step ID ("name:callIndex"), and on cache miss: writes an intent row (status='running').
+ * It executes with per-step retry (incrementing `attempts`), guards serializability, persists the result as 'completed', and logs.
+ *
+ * Throws when called outside a workflow context unless `allowUnbound: true` is set (for scripts/utilities).
+*/
+export function checkpoint<T extends AsyncSteps>(steps: T, options?: { allowUnbound?: boolean }): T {
   return new Proxy(steps, {
     get(target, prop, receiver) {
       const fn = Reflect.get(target, prop, receiver);

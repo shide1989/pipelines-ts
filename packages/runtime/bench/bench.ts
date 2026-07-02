@@ -16,7 +16,7 @@
 // CTE, unlock). Concurrency is bounded by the client pool (porsager default
 // max 10, minus 1 for the reserved ownership session).
 
-import { durable } from "../src/proxy";
+import { checkpoint } from "../src/proxy";
 import { startWorker, type Worker } from "../src/worker";
 import { setDefaultDb, workflow } from "../src/workflow";
 import { resetSchema, testDb, truncateAll, waitFor } from "../tests/helpers";
@@ -24,7 +24,7 @@ import { resetSchema, testDb, truncateAll, waitFor } from "../tests/helpers";
 const db = testDb();
 setDefaultDb(db);
 
-const steps = durable({
+const steps = checkpoint({
   noop: async (i: number) => i,
 });
 

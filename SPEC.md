@@ -20,7 +20,7 @@ The library is `pipelines`; the primitive is `workflow()`. This split is deliber
 - A **workflow** is a single durable, suspendable, resumable unit of execution (it can `sleep` for days and resume). This is the atomic primitive — `workflow(name, fn)`.
 - A **pipeline** is the *composition* of workflows chained together. This is a future feature; the `pipeline()` keyword is intentionally reserved for it, not used for the atomic unit.
 
-So the library name reflects the end goal (build pipelines out of workflows), while today's surface area is just `workflow()`, `durable()`, and `sleep()`. Do not rename `workflow()` to `pipeline()` — the distinction is intentional.
+So the library name reflects the end goal (build pipelines out of workflows), while today's surface area is just `workflow()`, `checkpoint()`, and `sleep()`. Do not rename `workflow()` to `pipeline()` — the distinction is intentional.
 
 ### Execution model in one breath
 
@@ -34,7 +34,7 @@ So the library name reflects the end goal (build pipelines out of workflows), wh
 ┌──────────────────────────────────────────────────────┐
 │                   Developer Code                      │
 │                                                       │
-│  const steps = durable({                              │
+│  const steps = checkpoint({                              │
 │    prepareContext: async (task) => { ... },           │
 │    callLLM:        async (ctx)  => { ... },           │
 │  });                                                  │
@@ -71,7 +71,7 @@ So the library name reflects the end goal (build pipelines out of workflows), wh
 │       missed NOTIFYs; the run rows ARE the durable    │
 │       queue)                                          │
 │    execute → run fn in AsyncLocalStorage:             │
-│       durable() Proxy → cache/replay steps            │
+│       checkpoint() Proxy → cache/replay steps            │
 │       sleep() → insert timer + suspend (zero compute) │
 │       append lifecycle rows to workflow_logs          │
 │                                                       │
@@ -105,15 +105,15 @@ So the library name reflects the end goal (build pipelines out of workflows), wh
 
 Provide a clean developer API where workflow code looks like vanilla async TypeScript — no `ctx` parameter threading, no manual step ID strings, no wrapper closures. Two native features do all the heavy lifting.
 
-### 1.1 `durable(steps)` — Proxy-based step wrapper
+### 1.1 `checkpoint(steps)` — Proxy-based step wrapper
 
 ```typescript
-function durable<T extends Record<string, (...args: any[]) => Promise<any>>>(
+function checkpoint<T extends Record<string, (...args: any[]) => Promise<any>>>(
   steps: T
 ): T;
 ```
 
-`durable()` takes an object of async functions and returns a **Proxy** that looks and types identically. When a method is called on the proxy:
+`checkpoint()` takes an object of async functions and returns a **Proxy** that looks and types identically. When a method is called on the proxy:
 
 1. The Proxy **`get` trap** captures the **method name** (e.g. `"callLLM"`) — the step ID base
 2. It reads the current **WorkflowContext** from **AsyncLocalStorage** — if there's no active context, it calls the original function directly (so steps work outside workflows too, useful for testing)
@@ -222,7 +222,7 @@ interface WorkflowContext {
 }
 ```
 
-Created by the engine when it claims a run, stored in AsyncLocalStorage, never exposed. `durable()` proxies and `sleep()` read it via `workflowStorage.getStore()`; if absent, they fall through to direct execution.
+Created by the engine when it claims a run, stored in AsyncLocalStorage, never exposed. `checkpoint()` proxies and `sleep()` read it via `workflowStorage.getStore()`; if absent, they fall through to direct execution.
 
 ---
 
@@ -447,7 +447,7 @@ pipelines/
 │   │   ├── package.json
 │   │   ├── src/
 │   │   │   ├── index.ts        # Public API: workflow, durable, sleep, FatalError, startWorker, getRun, listRuns, replayRun
-│   │   │   ├── proxy.ts        # durable() Proxy implementation
+│   │   │   ├── proxy.ts        # checkpoint() Proxy implementation
 │   │   │   ├── workflow.ts     # workflow() registration (registry) + .run() submission
 │   │   │   ├── context.ts      # WorkflowContext + AsyncLocalStorage store
 │   │   │   ├── engine.ts       # claim + execute + replay + lifecycle transitions
@@ -507,7 +507,7 @@ Each phase is independently demoable.
 **Deliverables:**
 - PostgreSQL schema + indexes + the `workflow_runs` wakeup trigger + docker-compose
 - `WorkflowContext` + AsyncLocalStorage wiring (`context.ts`)
-- `durable()` Proxy (`proxy.ts`) with the serializability guard
+- `checkpoint()` Proxy (`proxy.ts`) with the serializability guard
 - `workflow()` registration + `.run()` submission (insert `pending` + NOTIFY) (`workflow.ts`)
 - Engine: claim (`SKIP LOCKED`) + execute + replay + lifecycle transitions (`engine.ts`)
 - `sleep()` + `SleepInterrupt` + duration parser (`sleep.ts`)
@@ -596,9 +596,9 @@ The money-grounded hook: crash during validation, right after an expensive infer
 
 ```typescript
 // examples/agentic/workflow.ts
-import { workflow, durable, sleep, FatalError } from "pipelines";
+import { workflow, checkpoint, sleep, FatalError } from "pipelines";
 
-const steps = durable({
+const steps = checkpoint({
   prepareContext: async (task: { prompt: string; docId: string }) => {
     const context = await loadDocs(task.docId);
     return { prompt: task.prompt, context };
@@ -698,7 +698,7 @@ A minimal `examples/onboarding/` (signup → welcome → 7-day `sleep` → check
 - **Full lifecycle**: submit → steps → sleep → timer fires → resume → complete, with the `workflow_logs` trail in order
 - **Crash recovery**: kill worker mid-run → restart → replay (cached steps skipped)
 - **Concurrent workers**: multiple workers, `SKIP LOCKED`, no double-execution
-- **Steps outside workflows**: call a `durable()` method with no `pipeline`/`workflow` context → runs normally, no checkpointing
+- **Steps outside workflows**: call a `checkpoint()` method with no `pipeline`/`workflow` context → throws exception, this should not happen.
 
 ---
 
@@ -707,6 +707,6 @@ A minimal `examples/onboarding/` (signup → welcome → 7-day `sleep` → check
 1. **Advanced TypeScript** — Proxy + AsyncLocalStorage doing compiler-like work, in a real system, fully typed
 2. **Distributed-systems thinking** — durable execution, deterministic replay, submission/execution decoupling, crash recovery, the honest separation of push (events) vs poll (time)
 3. **PostgreSQL used properly** — `SKIP LOCKED` as a multi-worker queue, `LISTEN`/`NOTIFY` for instant wakeup, JSONB, partial indexes, monotonic-id log; and the correctness details (NOTIFY-on-commit visibility, recover-from-persisted-state)
-4. **API taste** — `workflow()` / `durable()` / `sleep()` is a tiny, fully-typed surface; workflow code reads like normal async TypeScript
+4. **API taste** — `workflow()` / `checkpoint()` / `sleep()` is a tiny, fully-typed surface; workflow code reads like normal async TypeScript
 5. **Architectural seams** — runtime is a library; transport, drivers, and the platform (`db.ts`) are isolated and swappable
 6. **Deliberate scope** — the constraints section shows what was *not* built (pure ES, parallelism, a compiler) and why; judgment, not feature-count

@@ -9,14 +9,14 @@
 // shows up as a second row from a different pid.
 
 import postgres from "postgres";
-import { durable, workflow } from "../../src/index";
+import { checkpoint, workflow } from "../../src/index";
 import { TEST_URL } from "../helpers";
 
 // Lazy client: opens connections only when a step executes (worker processes),
 // never in the test process that merely imports the handles.
 const sql = postgres(TEST_URL, { max: 2, onnotice: () => {} });
 
-const steps = durable({
+const steps = checkpoint({
   work: async (input: { key: string; ms: number }) => {
     await sql`INSERT INTO mw_exec (key, pid) VALUES (${input.key}, ${process.pid})`;
     await Bun.sleep(input.ms);

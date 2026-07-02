@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { FatalError } from "../src/errors";
 import { getRun, replayRun } from "../src/management";
-import { durable } from "../src/proxy";
+import { checkpoint } from "../src/proxy";
 import { sleep } from "../src/sleep";
 import type { LifecycleError, LifecycleResult } from "../src/types";
 import { startWorker } from "../src/worker";
@@ -23,7 +23,7 @@ const finishes: LifecycleResult<unknown>[] = [];
 const errors: LifecycleError[] = [];
 
 // --- Test workflows (self-register on import) -------------------------------
-const echoSteps = durable({
+const echoSteps = checkpoint({
   prepare: async (x: { v: number }) => {
     prepareCalls++;
     return { doubled: x.v * 2 };
@@ -34,7 +34,7 @@ const echoWf = workflow(
   async (x: { v: number }) => (await echoSteps.prepare(x)).doubled,
 );
 
-const sleepSteps = durable({
+const sleepSteps = checkpoint({
   before: async () => ({ at: "before" }),
   after: async () => ({ at: "after" }),
 });
@@ -45,7 +45,7 @@ const sleepWf = workflow("test.sleep", async () => {
   return "done";
 });
 
-const flakySteps = durable({
+const flakySteps = checkpoint({
   flaky: async () => {
     flakyAttempts++;
     if (flakyAttempts < 3) throw new Error("transient");
@@ -56,7 +56,7 @@ const flakyWf = workflow("test.flaky", async () => (await flakySteps.flaky()).ok
   retry: { maxRetries: 5, backoffMs: 5, backoffMultiplier: 1 },
 });
 
-const fatalSteps = durable({
+const fatalSteps = checkpoint({
   boom: async () => {
     fatalCalls++;
     throw new FatalError("nope");
@@ -71,7 +71,7 @@ const fatalWf = workflow(
 );
 
 let slowCalls = 0;
-const slowSteps = durable({
+const slowSteps = checkpoint({
   crunch: async () => {
     slowCalls++;
     await Bun.sleep(700); // long enough for several reconcile passes mid-execution
@@ -468,7 +468,7 @@ describe("Promise.all (forbidden — undefined behavior)", () => {
   let rightCalls = 0;
   beforeEach(() => { leftCalls = 0; rightCalls = 0; });
 
-  const parallelSteps = durable({
+  const parallelSteps = checkpoint({
     left: async () => { leftCalls++; return "L"; },
     right: async () => { rightCalls++; return "R"; },
   });
@@ -523,7 +523,7 @@ describe("Promise.all (forbidden — undefined behavior)", () => {
   // advisory lock while the other branch may still be writing in the background.
   // Works when the side step is faster than the sleep (commits before timer fires),
   // but races when the step is slow — two workers can execute the same run concurrently.
-  const sleepParallelSteps = durable({ side: async () => "side" });
+  const sleepParallelSteps = checkpoint({ side: async () => "side" });
   const sleepParallelWf = workflow("test.parallel.sleep", async () => {
     await Promise.all([sleep("1 second"), sleepParallelSteps.side()]);
     return "done";
@@ -545,7 +545,7 @@ describe("Promise.all (forbidden — undefined behavior)", () => {
 });
 
 describe("outside a workflow", () => {
-  const unboundSteps = durable({
+  const unboundSteps = checkpoint({
     prepare: async (x: { v: number }) => {
       prepareCalls++;
       return { doubled: x.v * 2 };

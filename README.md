@@ -44,7 +44,7 @@ Durable execution is the right abstraction: each step is checkpointed, crashes a
 
 `workflow().run(input)` inserts a `pending` row and returns a `runId` immediately — it does not execute inline. A worker wakes via `LISTEN`/`NOTIFY`, claims the run with `SKIP LOCKED`, and executes it inside `AsyncLocalStorage`.
 
-Step results are persisted to `workflow_steps`. On replay (crash, restart), `durable()` reads back the cached results instead of re-running the function. `sleep()` inserts a timer row and suspends the run — zero compute consumed while waiting, survives restarts at any duration.
+Step results are persisted to `workflow_steps`. On replay (crash, restart), `checkpoint()` reads back the cached results instead of re-running the function. `sleep()` inserts a timer row and suspends the run — zero compute consumed while waiting, survives restarts at any duration.
 
 The run rows in Postgres _are_ the durable queue. `NOTIFY` is a latency optimization, not a reliability mechanism.
 
@@ -68,7 +68,7 @@ docker compose up -d          # Postgres on :5432 for local dev
 
 ```typescript
 import postgres from "postgres";
-import { durable, setup, setDefaultDb, sleep, startWorker, workflow } from "pipelines";
+import { checkpoint, setup, setDefaultDb, sleep, startWorker, workflow } from "pipelines";
 import type { DatabaseClient } from "pipelines";
 
 // 1. Create a DatabaseClient adapter for your driver (porsager/postgres shown)
@@ -100,7 +100,7 @@ setDefaultDb(client);      // workflow().run() uses this client by default
 startWorker(client);       // starts the execution loop — keep this process alive
 
 // 3. Define steps — each is checkpointed; a crash replays from the last completed one
-const steps = durable({
+const steps = checkpoint({
   // Fetch context once — cached on replay, never re-fetched
   fetchContext: async (docId: string) => {
     const doc = await db.documents.findById(docId);
@@ -169,12 +169,12 @@ const { runId } = await myWorkflow.run(input, { idempotencyKey: "unique-key" });
 
 `onFinish` fires once on terminal state (`completed` or `failed`). `onError` fires on `failed` after retries are exhausted. Errors thrown inside these callbacks are caught and logged — a broken hook never fails the workflow.
 
-### `durable(steps)`
+### `checkpoint(steps)`
 
 Wraps an object of async functions with transparent checkpointing. The Proxy preserves full TypeScript types — no assertions needed.
 
 ```typescript
-const steps = durable({
+const steps = checkpoint({
   fetchData:  async (id: string)   => ({ ... }),
   transform:  async (data: Data)   => ({ ... }),
 });
@@ -264,7 +264,7 @@ Throw from a step to fail the run immediately, skipping retries.
 ```typescript
 import { FatalError } from "pipelines";
 
-const steps = durable({
+const steps = checkpoint({
   validate: async (output: string) => {
     if (!output.trim()) throw new FatalError("empty output");
     return { output };
