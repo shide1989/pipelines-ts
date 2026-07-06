@@ -25,7 +25,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "schema.sql"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc-esm-fix --tsconfig tsconfig.build.json",
