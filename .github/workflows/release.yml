@@ -1,0 +1,96 @@
+name: Release
+
+# release-please manages version bumping + tagging + GitHub release for the
+# published `pipelines-ts` package (packages/runtime), driven by Conventional
+# Commits. A downstream publish job runs only when release-please created a
+# release, behind a protected `publish` environment (human approval) and with
+# npm provenance.
+#
+# Prerequisites (repo settings, not automatable here):
+#   1. npm granular access token, scoped to `pipelines-ts` (read+write, expiry).
+#   2. Add it as secret `NPM_TOKEN` on the `publish` environment (preferred) or repo.
+#   3. Create a `publish` environment with required reviewers so publish needs approval.
+#   4. First run bootstraps from 0.5.0 — review the proposed version in the release
+#      PR before merging (the schema.sql fix is `fix:` → expects 0.5.1).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Version bump & tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create tag + GitHub release
+      pull-requests: write  # open/update the release PR
+    outputs:
+      release_created: ${{ steps.release.outputs['packages/runtime--release_created'] }}
+      tag: ${{ steps.release.outputs['packages/runtime--tag_name'] }}
+      version: ${{ steps.release.outputs['packages/runtime--version'] }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: node
+          path: packages/runtime
+          package-name: pipelines-ts
+          # Plain `vX.Y.Z` tags (no component prefix). Fine while only one
+          # package is published; revisit if a second package ships.
+          include-component-in-tag: false
+
+  publish:
+    name: Publish to npm
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    environment: publish            # protected env → human approval + NPM_TOKEN
+    permissions:
+      contents: read
+      id-token: write               # npm provenance (SLSA)
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4   # reads packageManager from package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches package version
+        run: |
+          set -euo pipefail
+          PKG_VER=$(node -p "require('./packages/runtime/package.json').version")
+          TAG="${{ needs.release-please.outputs.tag }}"
+          echo "package=$PKG_VER tag=$TAG"
+          [ "v$PKG_VER" = "$TAG" ] || { echo "tag/tag ≠ package version"; exit 1; }
+
+      - name: Skip if version already on npm
+        run: |
+          set -euo pipefail
+          PKG_VER=$(node -p "require('./packages/runtime/package.json').version")
+          if npm view pipelines-ts@"$PKG_VER" version >/dev/null 2>&1; then
+            echo "pipelines-ts@$PKG_VER already published — skipping"
+            echo "skip=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build & publish
+        if: ${{ env.skip != 'true' }}
+        working-directory: packages/runtime
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
