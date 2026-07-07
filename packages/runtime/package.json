@@ -1,6 +1,6 @@
 {
   "name": "pipelines-ts",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Durable workflow runtime with replayable, idempotent steps.",
   "license": "MIT",
   "author": "Sebastien Hideux",
